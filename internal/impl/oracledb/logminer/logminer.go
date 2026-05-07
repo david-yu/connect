@@ -55,7 +55,8 @@ type LogMiner struct {
 }
 
 // NewMiner creates a new instance of LogMiner responsible for paging through change events based on the tables param.
-func NewMiner(db *sql.DB, userTables []replication.UserTable, publisher replication.ChangePublisher, cfg *Config, metrics *service.Metrics, logger *service.Logger) *LogMiner {
+// txnCache sets the transaction buffer implementation; pass nil to use the default in-memory cache.
+func NewMiner(db *sql.DB, userTables []replication.UserTable, publisher replication.ChangePublisher, cfg *Config, txnCache TransactionCache, metrics *service.Metrics, logger *service.Logger) *LogMiner {
 	// Build table filter condition once
 	// Only filter DML operations (1=INSERT, 2=DELETE, 3=UPDATE) by table
 	// Transaction control operations (6=START, 7=COMMIT, 36=ROLLBACK) don't have table info
@@ -106,9 +107,12 @@ func NewMiner(db *sql.DB, userTables []replication.UserTable, publisher replicat
 		logMinerQuery: logMinerQuery,
 		logCollector:  NewLogFileCollector(),
 		sessionMgr:    NewSessionManager(cfg, logger),
-		txnCache:      NewInMemoryCache(cfg.MaxTransactionEvents, metrics, logger),
+		txnCache:      txnCache,
 		dmlParser:     sqlredo.NewParser(),
 		lobStates:     make(map[sqlredo.TransactionID]*sqlredo.TxnLOBState),
+	}
+	if lm.txnCache == nil {
+		lm.txnCache = NewInMemoryCache(cfg.MaxTransactionEvents, metrics, logger)
 	}
 	return lm
 }
