@@ -65,6 +65,7 @@ csv                       ,input     ,csv                       ,0.0.0   ,certif
 csv                       ,scanner   ,csv                       ,0.0.0   ,certified  ,n          ,y     ,y
 cyborgdb                  ,output    ,cyborgdb                  ,4.66.0  ,community  ,n          ,y     ,y
 cypher                    ,output    ,cypher                    ,4.37.0  ,community  ,n          ,n     ,n
+db2_cdc                   ,input     ,db2_cdc                   ,4.80.0  ,enterprise ,n          ,n     ,n
 decompress                ,processor ,decompress                ,0.0.0   ,certified  ,n          ,y     ,y
 decompress                ,scanner   ,decompress                ,0.0.0   ,certified  ,n          ,y     ,y
 dedupe                    ,processor ,dedupe                    ,0.0.0   ,certified  ,n          ,y     ,y
