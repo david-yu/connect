@@ -962,3 +962,70 @@ func TestInitializeFiltersMissingTables(t *testing.T) {
 	assert.Contains(t, err.Error(), "PAYROLL",
 		"error must name the missing table so the operator knows which registration to add")
 }
+
+// ---------------------------------------------------------------------------
+// eventToMessage — heartbeat
+// ---------------------------------------------------------------------------
+
+func TestEventToMessageHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	event := replication.ChangeEvent{
+		Operation: replication.OpTypeHeartbeat,
+		Timestamp: ts,
+	}
+
+	d := &db2CDCInput{}
+	msg, err := d.eventToMessage(event)
+	require.NoError(t, err)
+
+	b, err := msg.AsBytes()
+	require.NoError(t, err)
+
+	var envelope map[string]any
+	require.NoError(t, json.Unmarshal(b, &envelope))
+
+	assert.Equal(t, "hb", envelope["op"])
+	assert.Equal(t, float64(ts.UnixMilli()), envelope["ts_ms"])
+
+	op, _ := msg.MetaGet("db2_operation")
+	assert.Equal(t, "heartbeat", op)
+	opCode, _ := msg.MetaGet("db2_op")
+	assert.Equal(t, "hb", opCode)
+
+
+	schemaVal, schemaExists := msg.MetaGet("db2_schema")
+	assert.True(t, schemaExists, "db2_schema must be set on heartbeat")
+	assert.Empty(t, schemaVal)
+
+	tableVal, tableExists := msg.MetaGet("db2_table")
+	assert.True(t, tableExists, "db2_table must be set on heartbeat")
+	assert.Empty(t, tableVal)
+
+	csnVal, csnExists := msg.MetaGet("db2_csn")
+	assert.True(t, csnExists, "db2_csn must be set on heartbeat")
+	assert.Empty(t, csnVal)
+
+	commitLSN, commitLSNExists := msg.MetaGet("db2_commit_lsn")
+	assert.True(t, commitLSNExists, "db2_commit_lsn must be set on heartbeat")
+	assert.Empty(t, commitLSN)
+
+	connector, connectorExists := msg.MetaGet("db2_connector")
+	assert.True(t, connectorExists, "db2_connector must be set on heartbeat")
+	assert.Equal(t, "db2", connector)
+
+	snapshot, snapshotExists := msg.MetaGet("db2_snapshot")
+	assert.True(t, snapshotExists, "db2_snapshot must be set on heartbeat")
+	assert.Equal(t, "false", snapshot)
+
+	tsVal, tsExists := msg.MetaGet("db2_timestamp")
+	assert.True(t, tsExists, "db2_timestamp must be set when Timestamp is non-zero")
+	assert.Equal(t, ts.Format(time.RFC3339Nano), tsVal)
+
+
+	// Heartbeat must not have before/after/source fields.
+	assert.NotContains(t, envelope, "before")
+	assert.NotContains(t, envelope, "after")
+	assert.NotContains(t, envelope, "source")
+}

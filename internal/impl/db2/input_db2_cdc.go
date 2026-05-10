@@ -43,6 +43,7 @@ const (
 	db2CDCFieldCheckpointLimit          = "checkpoint_limit"
 	db2CDCFieldStreamBackoffInterval    = "stream_backoff_interval"
 	db2CDCFieldPollBatchSize            = "poll_batch_size"
+	db2CDCFieldHeartbeatInterval        = "heartbeat_interval"
 
 	// db2CDCEventChanBuf is the number of change events buffered between the
 	// background CDC goroutine and ReadBatch. Sized to allow one poll batch to be
@@ -266,6 +267,14 @@ The connector tracks the highest processed `+"`IBMSNAP_COMMITSEQ`"+` so it can r
 				Default(1000).
 				Advanced(),
 
+			service.NewDurationField(db2CDCFieldHeartbeatInterval).
+				Description("When set to a positive duration, a heartbeat message (`op=hb`) is emitted at this interval "+
+					"even when no CDC changes are available. "+
+					"Use this to keep downstream consumers alive on low-traffic tables. "+
+					"Set to 0 to disable (default).").
+				Default("0s").
+				Advanced(),
+
 			service.NewAutoRetryNacksToggleField(),
 			service.NewBatchPolicyField("batching"),
 		)
@@ -291,6 +300,8 @@ type db2CDCInput struct {
 	checkpointLimit    int
 	cpCacheName        string // external cache resource name; empty = use DB2 table
 	cpCacheTableName   string
+
+	heartbeatInterval time.Duration
 
 	snapshotConfig replication.SnapshotConfig
 	streamConfig   replication.StreamConfig
@@ -435,13 +446,19 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 		return nil, errors.New("poll_batch_size must be at least 1")
 	}
 
+	heartbeatInterval, err := conf.FieldDuration(db2CDCFieldHeartbeatInterval)
+	if err != nil {
+		return nil, err
+	}
+
 	tableFilterFn := tableFilter.Matches
 
 	d := &db2CDCInput{
 		dsn:                dsn,
 		schema:             schema,
 		tables:             tables,
-		tableFilter:        tableFilter,
+		tableFilter:       tableFilter,
+		heartbeatInterval: heartbeatInterval,
 		asnCDCSchema:   asnCDCSchema,
 		snapshotMode:   mode,
 		checkpointMode: checkpointMode,
@@ -744,6 +761,10 @@ func (d *db2CDCInput) runStreaming(ctx context.Context) error {
 		return fmt.Errorf("initializing streamer: %w", err)
 	}
 
+	if d.heartbeatInterval > 0 {
+		go d.runHeartbeat(ctx)
+	}
+
 	handler := func(event replication.ChangeEvent) error {
 		select {
 		case d.eventChan <- event:
@@ -756,6 +777,31 @@ func (d *db2CDCInput) runStreaming(ctx context.Context) error {
 	}
 
 	return streamer.Stream(ctx, handler)
+}
+
+func (d *db2CDCInput) runHeartbeat(ctx context.Context) {
+	ticker := time.NewTicker(d.heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			hb := replication.ChangeEvent{
+				Operation: replication.OpTypeHeartbeat,
+				Timestamp: time.Now().UTC(),
+			}
+			select {
+			case d.eventChan <- hb:
+			case <-ctx.Done():
+				return
+			case <-d.shutSig.SoftStopChan():
+				return
+			}
+		case <-ctx.Done():
+			return
+		case <-d.shutSig.SoftStopChan():
+			return
+		}
+	}
 }
 
 // debeziumOp maps a replication.OpType to the single-character Debezium operation code
@@ -772,6 +818,8 @@ func debeziumOp(op replication.OpType) string {
 		return "d"
 	case replication.OpTypeRead:
 		return "r"
+	case replication.OpTypeHeartbeat:
+		return "hb"
 	default:
 		return string(op)
 	}
@@ -823,6 +871,19 @@ func debeziumSnapshotValue(op replication.OpType) string {
 //   - db2_snapshot      — "true" for snapshot rows, "false" for streaming rows
 //   - db2_timestamp     — IBMSNAP_LOGMARKER timestamp (RFC3339Nano; omitted if zero)
 func (*db2CDCInput) eventToMessage(event replication.ChangeEvent) (*service.Message, error) {
+	if event.Operation == replication.OpTypeHeartbeat {
+		tsMs := event.Timestamp.UnixMilli()
+		envelope := map[string]any{
+			"op":    "hb",
+			"ts_ms": tsMs,
+		}
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(envelope)
+		msg.MetaSetMut("db2_operation", "heartbeat")
+		msg.MetaSetMut("db2_op", "hb")
+		return msg, nil
+	}
+
 	// Determine source timestamp in epoch-milliseconds.
 	var tsMs int64
 	if !event.Timestamp.IsZero() {

@@ -287,6 +287,10 @@ const (
 	opTypeUpdateAfter  OpType = "_update_after"  // IBMSNAP_OPCODE=4
 )
 
+// OpTypeHeartbeat is emitted periodically when no CDC changes are available.
+// Used to keep downstream consumers alive on low-traffic tables.
+const OpTypeHeartbeat OpType = "heartbeat"
+
 // FromDB2Op converts a DB2 IBMSNAP_OPERATION code to an OpType.
 //
 // DB2 LUW SQL Replication uses three operation codes:
