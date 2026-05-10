@@ -384,20 +384,35 @@ func (s *Streamer) buildPollQuery(changeTableName string, afterCSN CSN, afterInt
 	if afterIntentSeq > 0 {
 		// Composite pagination: resume within the same CSN using IntentSeq.
 		afterPredicate = fmt.Sprintf(
-			"(IBMSNAP_COMMITSEQ > X'%s' OR (IBMSNAP_COMMITSEQ = X'%s' AND IBMSNAP_INTENTSEQ > %d))",
+			"(cdc.IBMSNAP_COMMITSEQ > X'%s' OR (cdc.IBMSNAP_COMMITSEQ = X'%s' AND cdc.IBMSNAP_INTENTSEQ > %d))",
 			afterHex, afterHex, afterIntentSeq,
 		)
 	} else {
-		afterPredicate = fmt.Sprintf("IBMSNAP_COMMITSEQ > X'%s'", afterHex)
+		afterPredicate = fmt.Sprintf("cdc.IBMSNAP_COMMITSEQ > X'%s'", afterHex)
 	}
 
+	// LEAD/LAG window functions classify each D/I row within a COMMITSEQ:
+	//   OPCODE 1 = standalone DELETE
+	//   OPCODE 2 = standalone INSERT
+	//   OPCODE 3 = before-image of UPDATE (D row with an immediately following I)
+	//   OPCODE 4 = after-image of UPDATE  (I row with an immediately preceding D)
+	// Ported from Debezium LuwPlatform.java CHANGE_TABLE_DATA_COLUMNS_QUERY.
 	return fmt.Sprintf(`
-		SELECT *
-		FROM %s
-		WHERE IBMSNAP_OPERATION IN ('I', 'D')
-		  AND %s
-		  AND IBMSNAP_COMMITSEQ <= X'%s'
-		ORDER BY IBMSNAP_COMMITSEQ, IBMSNAP_INTENTSEQ
+		SELECT CASE
+		  WHEN cdc.IBMSNAP_OPERATION = 'D'
+		       AND LEAD(cdc.IBMSNAP_OPERATION,1,'X') OVER (PARTITION BY cdc.IBMSNAP_COMMITSEQ ORDER BY cdc.IBMSNAP_INTENTSEQ) = 'I'
+		       THEN 3
+		  WHEN cdc.IBMSNAP_OPERATION = 'I'
+		       AND LAG(cdc.IBMSNAP_OPERATION,1,'X') OVER (PARTITION BY cdc.IBMSNAP_COMMITSEQ ORDER BY cdc.IBMSNAP_INTENTSEQ) = 'D'
+		       THEN 4
+		  WHEN cdc.IBMSNAP_OPERATION = 'D' THEN 1
+		  WHEN cdc.IBMSNAP_OPERATION = 'I' THEN 2
+		END AS IBMSNAP_OPCODE,
+		cdc.*
+		FROM %s cdc
+		WHERE %s
+		  AND cdc.IBMSNAP_COMMITSEQ <= X'%s'
+		ORDER BY cdc.IBMSNAP_COMMITSEQ, cdc.IBMSNAP_INTENTSEQ
 		FETCH FIRST %d ROWS ONLY
 	`, changeTableName, afterPredicate, upperHex, s.config.PollBatchSize)
 }
@@ -423,7 +438,7 @@ func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableNa
 	}
 
 	// Locate metadata columns by name; collect data column indices.
-	opIdx, csnIdx, intentSeqIdx, tsIdx := -1, -1, -1, -1
+	opIdx, csnIdx, intentSeqIdx, tsIdx, opcodeIdx := -1, -1, -1, -1, -1
 	dataColIdxs := make([]int, 0)
 	dataColNames := make([]string, 0)
 
@@ -437,6 +452,8 @@ func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableNa
 			intentSeqIdx = i
 		case "IBMSNAP_LOGMARKER":
 			tsIdx = i
+		case "IBMSNAP_OPCODE":
+			opcodeIdx = i
 		default:
 			if !strings.HasPrefix(col, "IBMSNAP_") {
 				dataColIdxs = append(dataColIdxs, i)
@@ -461,7 +478,6 @@ func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableNa
 			return nil, fmt.Errorf("scanning row from %s: %w", changeTableName, err)
 		}
 
-		operation := getString(scanDest[opIdx])
 		csnBytes := getBytes(scanDest[csnIdx])
 		intentSeq := getInt64(scanDest[intentSeqIdx])
 
@@ -472,8 +488,16 @@ func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableNa
 
 		csn := NewCSNFromDBValue(csnBytes)
 
-		opType, err := FromDB2Op(operation)
-		if err != nil {
+		var opType OpType
+		var opErr error
+		if opcodeIdx >= 0 {
+			code := getInt64(scanDest[opcodeIdx])
+			opType, opErr = fromOpcodeInt(code)
+		} else {
+			operation := getString(scanDest[opIdx])
+			opType, opErr = FromDB2Op(operation)
+		}
+		if opErr != nil {
 			// Skip unknown operation types rather than failing the whole batch.
 			continue
 		}
@@ -495,7 +519,48 @@ func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableNa
 		})
 	}
 
+	events = pairOpcodeEvents(events)
 	return events, rows.Err()
+}
+
+// pairOpcodeEvents merges consecutive opTypeUpdateBefore + opTypeUpdateAfter pairs
+// (produced by the LEAD/LAG query) into a single OpTypeUpdate event with BeforeData
+// populated. Pairs must be consecutive and share the same CSN (guaranteed by the
+// LEAD/LAG window function and computeSafeCSN pagination).
+func pairOpcodeEvents(events []ChangeEvent) []ChangeEvent {
+	if len(events) == 0 {
+		return events
+	}
+	out := make([]ChangeEvent, 0, len(events))
+	for i := 0; i < len(events); i++ {
+		ev := events[i]
+		if ev.Operation == opTypeUpdateBefore && i+1 < len(events) {
+			next := events[i+1]
+			if next.Operation == opTypeUpdateAfter && next.CSN.Equal(ev.CSN) {
+				out = append(out, ChangeEvent{
+					Schema:     next.Schema,
+					Table:      next.Table,
+					Operation:  OpTypeUpdate,
+					CSN:        next.CSN,
+					IntentSeq:  next.IntentSeq,
+					Timestamp:  next.Timestamp,
+					Data:       next.Data,
+					BeforeData: ev.Data,
+				})
+				i++ // skip the after-image row
+				continue
+			}
+		}
+		// Emit orphaned update-before/after as delete/insert (safety fallback).
+		switch ev.Operation {
+		case opTypeUpdateBefore:
+			ev.Operation = OpTypeDelete
+		case opTypeUpdateAfter:
+			ev.Operation = OpTypeInsert
+		}
+		out = append(out, ev)
+	}
+	return out
 }
 
 // sortEventsByCSN sorts events using a min-heap ordered by (CSN, IntentSeq).

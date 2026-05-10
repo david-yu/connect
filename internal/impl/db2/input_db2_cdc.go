@@ -69,7 +69,7 @@ The connector operates in two phases:
 
 == UPDATE representation
 
-DB2 LUW SQL Replication encodes UPDATE operations as a DELETE record followed by an INSERT record that share the same `+"`IBMSNAP_COMMITSEQ`"+` value. This connector emits both events individually — `+"`operation: delete`"+` then `+"`operation: insert`"+`. Downstream consumers can reconstruct the before/after image by correlating the pair on `+"`csn`"+` and the row primary key.
+DB2 LUW SQL Replication encodes UPDATE operations as a DELETE record followed by an INSERT record that share the same `+"`IBMSNAP_COMMITSEQ`"+` value. This connector detects these pairs using window functions and merges them into a single `+"`op: u`"+` (update) event with the `+"`before`"+` field populated with the old row data and `+"`after`"+` with the new row data.
 
 == Message format (Debezium-compatible)
 
@@ -96,7 +96,7 @@ The message body matches the https://debezium.io/documentation/reference/stable/
 
 `+"**`op` codes**"+` match Debezium: `+"`c`"+` = create/insert, `+"`u`"+` = update, `+"`d`"+` = delete, `+"`r`"+` = read (snapshot).
 
-`+"**`before` field**"+`: DB2 LUW SQL Replication stores only the after-image in the change table for all operation types. `+"`before`"+` is therefore always `+"`null`"+`. The before-image of a DELETE or UPDATE can be reconstructed by correlating consecutive D+I pairs that share the same `+"`commit_lsn`"+` and primary key (see *UPDATE representation* above).
+`+"**`before` field**"+`: Populated per Debezium semantics. For `+"`op: u`"+` (update) events, `+"`before`"+` contains the old row data and `+"`after`"+` contains the new row data. For `+"`op: d`"+` (delete) events, `+"`before`"+` contains the deleted row and `+"`after`"+` is `+"`null`"+`. For `+"`op: c`"+` (insert) and `+"`op: r`"+` (snapshot read) events, `+"`before`"+` is `+"`null`"+`.
 
 `+"**`change_lsn`**"+`: DB2 LUW SQL Replication exposes only `+"`IBMSNAP_COMMITSEQ`"+` (the commit LSN). The intra-transaction LSN (`+"`change_lsn`"+` in Debezium) is not available and is always `+"`null`"+`.
 
@@ -679,9 +679,6 @@ func (d *db2CDCInput) runStreaming(ctx context.Context) error {
 // used in the "op" field of the Debezium envelope and in the db2_op metadata key.
 //
 // Debezium codes: c=create (insert), u=update, d=delete, r=read (snapshot).
-// DB2 LUW SQL Replication never emits a true "update" event — every UPDATE is
-// encoded as a D+I pair — so OpTypeUpdate maps to "u" but is never reached in
-// practice.
 func debeziumOp(op replication.OpType) string {
 	switch op {
 	case replication.OpTypeInsert:
@@ -725,11 +722,11 @@ func debeziumSnapshotValue(op replication.OpType) string {
 //	  "ts_ms":   <epoch-ms>
 //	}
 //
-// DB2 LUW SQL Replication stores only the after-image in the change table for
-// all operation types (INSERT, DELETE, the two halves of an UPDATE pair). There
-// is therefore no before-image available; "before" is always null. Consumers
-// that need the before-image of a DELETE or the pre-UPDATE state must correlate
-// consecutive D+I pairs that share the same CSN and primary key.
+// The before/after fields follow Debezium semantics:
+//   - INSERT (op="c"): before=null, after=new row
+//   - UPDATE (op="u"): before=old row data, after=new row data
+//   - DELETE (op="d"): before=deleted row data, after=null
+//   - READ   (op="r"): before=null, after=snapshot row
 //
 // Metadata keys set on the message:
 //
@@ -763,16 +760,27 @@ func (*db2CDCInput) eventToMessage(event replication.ChangeEvent) (*service.Mess
 		"ts_ms":      tsMs,
 	}
 
-	// DB2 LUW SQL Replication stores only the after-image in the change table
-	// for all operation types. "before" is therefore always null. The row data
-	// for a DELETE represents the deleted row state; surfacing it as "after"
-	// preserves the information — strict Debezium semantics (before=data,
-	// after=null for deletes) can be applied via a downstream Bloblang processor.
-	// See function doc comment for details.
-	after := event.Data
+	// Populate before/after fields per Debezium semantics:
+	//   INSERT (c): before=null,            after=new row
+	//   UPDATE (u): before=old row data,    after=new row data
+	//   DELETE (d): before=deleted row data, after=null
+	//   READ   (r): before=null,            after=snapshot row
+	var before any
+	var after any
+	switch event.Operation {
+	case replication.OpTypeDelete:
+		before = event.Data
+		after = nil
+	case replication.OpTypeUpdate:
+		before = event.BeforeData
+		after = event.Data
+	default:
+		before = nil
+		after = event.Data
+	}
 
 	envelope := map[string]any{
-		"before": nil,
+		"before": before,
 		"after":  after,
 		"source": source,
 		"op":     debeziumOp(event.Operation),

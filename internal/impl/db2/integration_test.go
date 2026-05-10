@@ -10,6 +10,7 @@ package db2_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -232,4 +233,110 @@ func asncapPID() string {
 		return "none"
 	}
 	return pid
+}
+
+// TestIntegrationDB2CDCUpdateBeforeImage verifies that UPDATE operations
+// produce a single event with op="u", before=old row, after=new row.
+func TestIntegrationDB2CDCUpdateBeforeImage(t *testing.T) {
+	integration.CheckSkip(t)
+
+	db := db2test.SetupTest(t)
+	ctx := t.Context()
+
+	// Cleanup from any previous run.
+	_, _ = db.ExecContext(ctx, `DROP TABLE ASNCDC."CDC_DB2INST1_CDC_UPDATE_TEST"`)
+	_, _ = db.ExecContext(ctx, `DELETE FROM ASNCDC.IBMSNAP_PRUNCNTL WHERE SOURCE_TABLE='CDC_UPDATE_TEST'`)
+	_, _ = db.ExecContext(ctx, `DELETE FROM ASNCDC.IBMSNAP_REGISTER WHERE SOURCE_TABLE='CDC_UPDATE_TEST'`)
+	_, _ = db.ExecContext(ctx, `DROP TABLE DB2INST1.CDC_UPDATE_TEST`)
+	_, _ = db.ExecContext(ctx, `DROP TABLE DB2INST1.CDC_UPDATE_CHECKPOINT`)
+
+	db.MustExecContext(ctx, `CREATE TABLE DB2INST1.CDC_UPDATE_TEST (ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(100))`)
+	db.MustExecContext(ctx, `INSERT INTO DB2INST1.CDC_UPDATE_TEST (ID, NAME) VALUES (1, 'original')`)
+	db.EnableASNCDC("DB2INST1", []string{"CDC_UPDATE_TEST"})
+
+	connectorYAML := fmt.Sprintf(`
+db2_cdc:
+  dsn: %q
+  schema: "DB2INST1"
+  tables: ["CDC_UPDATE_TEST"]
+  stream_snapshot: false
+  poll_batch_size: 100
+  stream_backoff_interval: 200ms
+  checkpoint_cache_table_name: "DB2INST1.CDC_UPDATE_CHECKPOINT"
+`, db.DSN)
+
+	type cdcEvent struct {
+		op     string
+		before map[string]any
+		after  map[string]any
+	}
+	var (
+		received   []cdcEvent
+		receivedMu sync.Mutex
+	)
+
+	streamBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamBuilder.AddInputYAML(connectorYAML))
+	require.NoError(t, streamBuilder.AddBatchConsumerFunc(func(_ context.Context, batch service.MessageBatch) error {
+		receivedMu.Lock()
+		defer receivedMu.Unlock()
+		for _, msg := range batch {
+			b, err := msg.AsBytes()
+			if err != nil {
+				continue
+			}
+			t.Logf("CDC event: %s", b)
+			var env map[string]any
+			if jsonErr := json.Unmarshal(b, &env); jsonErr != nil {
+				continue
+			}
+			op, _ := env["op"].(string)
+			var before, after map[string]any
+			if v, ok := env["before"]; ok && v != nil {
+				before, _ = v.(map[string]any)
+			}
+			if v, ok := env["after"]; ok && v != nil {
+				after, _ = v.(map[string]any)
+			}
+			received = append(received, cdcEvent{op: op, before: before, after: after})
+		}
+		return nil
+	}))
+
+	stream, err := streamBuilder.Build()
+	require.NoError(t, err)
+	license.InjectTestService(stream.Resources())
+
+	streamDone := make(chan error, 1)
+	go func() {
+		streamDone <- stream.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		if err := stream.StopWithin(10 * time.Second); err != nil {
+			t.Logf("stream stop: %v", err)
+		}
+		if err := <-streamDone; err != nil && !errors.Is(err, context.Canceled) {
+			t.Logf("stream error: %v", err)
+		}
+	})
+
+	// Let streaming stabilize.
+	time.Sleep(5 * time.Second)
+
+	// Perform an UPDATE — DB2 SQL Replication captures this as a D+I pair in the CD table.
+	db.MustExecContext(ctx, `UPDATE DB2INST1.CDC_UPDATE_TEST SET NAME = 'updated' WHERE ID = 1`)
+
+	assert.Eventually(t, func() bool {
+		receivedMu.Lock()
+		defer receivedMu.Unlock()
+		for _, e := range received {
+			if e.op == "u" && e.before != nil && e.after != nil {
+				name, _ := e.before["NAME"].(string)
+				newName, _ := e.after["NAME"].(string)
+				return name == "original" && newName == "updated"
+			}
+		}
+		return false
+	}, 2*time.Minute, 500*time.Millisecond,
+		"expected UPDATE event with op='u', before.NAME='original', after.NAME='updated'")
 }

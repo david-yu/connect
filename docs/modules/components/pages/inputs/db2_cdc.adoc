@@ -101,7 +101,7 @@ The connector operates in two phases:
 
 == UPDATE representation
 
-DB2 LUW SQL Replication encodes UPDATE operations as a DELETE record followed by an INSERT record that share the same `IBMSNAP_COMMITSEQ` value. This connector emits both events individually — `operation: delete` then `operation: insert`. Downstream consumers can reconstruct the before/after image by correlating the pair on `csn` and the row primary key.
+DB2 LUW SQL Replication encodes UPDATE operations as a DELETE record followed by an INSERT record that share the same `IBMSNAP_COMMITSEQ` value. This connector detects these pairs using LEAD/LAG window functions (ported from the Debezium DB2 connector) and merges them into a single `op: u` (update) event. The `before` field contains the old row data and `after` contains the new row data.
 
 == Message format
 

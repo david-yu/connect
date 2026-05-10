@@ -22,12 +22,14 @@ func TestBuildPollQuery(t *testing.T) {
 
 	query := s.buildPollQuery("ASNCDC.EMPLOYEES_CT", afterCSN, 0, upperCSN)
 
-	assert.Contains(t, query, "SELECT *")
-	assert.NotContains(t, query, "IBMSNAP_OPERATION,") // must not list metadata cols before *
-	assert.Contains(t, query, "IBMSNAP_OPERATION IN ('I', 'D')")
-	assert.Contains(t, query, "IBMSNAP_COMMITSEQ >")
-	assert.Contains(t, query, "IBMSNAP_COMMITSEQ <=")
-	assert.Contains(t, query, "IBMSNAP_COMMITSEQ, IBMSNAP_INTENTSEQ")
+	// New LEAD/LAG query: selects computed IBMSNAP_OPCODE column then cdc.*
+	assert.Contains(t, query, "IBMSNAP_OPCODE")
+	assert.Contains(t, query, "LEAD(cdc.IBMSNAP_OPERATION")
+	assert.Contains(t, query, "LAG(cdc.IBMSNAP_OPERATION")
+	assert.Contains(t, query, "FROM ASNCDC.EMPLOYEES_CT cdc")
+	assert.Contains(t, query, "cdc.IBMSNAP_COMMITSEQ >")
+	assert.Contains(t, query, "cdc.IBMSNAP_COMMITSEQ <=")
+	assert.Contains(t, query, "cdc.IBMSNAP_COMMITSEQ, cdc.IBMSNAP_INTENTSEQ")
 	assert.Contains(t, query, "FETCH FIRST 100 ROWS ONLY")
 	assert.Contains(t, query, "X'00000000000000000000'") // afterCSN = 0
 	// 12345 = 0x3039 → uint64 big-endian in bytes 0-7: [0,0,0,0,0,0,0x30,0x39]; bytes 8-9: zeros

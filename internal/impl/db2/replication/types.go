@@ -265,10 +265,6 @@ func (c CSN) SQLHex(lsnByteLen int) string {
 }
 
 // OpType represents a CDC operation type.
-//
-// This connector emits "read", "insert", and "delete" for all normal operation.
-// DB2 LUW SQL Replication encodes an UPDATE as a DELETE+INSERT pair sharing the
-// same IBMSNAP_COMMITSEQ, so "update" is defined but never emitted.
 type OpType string
 
 // OpType values for CDC operations.
@@ -277,12 +273,18 @@ const (
 	OpTypeInsert OpType = "insert" // INSERT operation
 	OpTypeDelete OpType = "delete" // DELETE operation
 
-	// OpTypeUpdate is defined for completeness but is never emitted by this connector.
-	// DB2 LUW SQL Replication encodes every UPDATE as a D+I pair (DELETE of the old
-	// row followed by INSERT of the new row, both sharing the same IBMSNAP_COMMITSEQ).
-	// Consumers should correlate consecutive delete+insert events on the same CSN and
-	// primary key to reconstruct the before/after image of an update.
+	// OpTypeUpdate is emitted by pairOpcodeEvents when a LEAD/LAG window query
+	// detects a D+I pair sharing the same IBMSNAP_COMMITSEQ. BeforeData holds
+	// the pre-update row and Data holds the post-update row.
 	OpTypeUpdate OpType = "update"
+)
+
+// opTypeUpdateBefore and opTypeUpdateAfter are internal-only intermediate
+// values emitted by the LEAD/LAG SQL query. They are never exported as part
+// of a ChangeEvent; pairOpcodeEvents merges them into OpTypeUpdate.
+const (
+	opTypeUpdateBefore OpType = "_update_before" // IBMSNAP_OPCODE=3
+	opTypeUpdateAfter  OpType = "_update_after"  // IBMSNAP_OPCODE=4
 )
 
 // FromDB2Op converts a DB2 IBMSNAP_OPERATION code to an OpType.
@@ -311,6 +313,23 @@ func FromDB2Op(dbOp string) (OpType, error) {
 		return OpTypeDelete, nil
 	default:
 		return "", fmt.Errorf("unknown DB2 operation: %s", dbOp)
+	}
+}
+
+// fromOpcodeInt maps an IBMSNAP_OPCODE integer (from the LEAD/LAG subquery)
+// to an OpType. Returns an error for unknown values.
+func fromOpcodeInt(code int64) (OpType, error) {
+	switch code {
+	case 1:
+		return OpTypeDelete, nil
+	case 2:
+		return OpTypeInsert, nil
+	case 3:
+		return opTypeUpdateBefore, nil
+	case 4:
+		return opTypeUpdateAfter, nil
+	default:
+		return "", fmt.Errorf("unknown IBMSNAP_OPCODE %d", code)
 	}
 }
 
@@ -430,24 +449,22 @@ func (v Version) SupportsEventStore() bool {
 // daemon and emitted as a Redpanda Connect message.
 //
 // For snapshot events (Operation == OpTypeRead) CSN is the null CSN and
-// BeforeData is always nil. For streaming events CSN carries the
+// BeforeData is nil. For streaming events CSN carries the
 // IBMSNAP_COMMITSEQ value; IntentSeq (IBMSNAP_INTENTSEQ) orders rows within
 // the same transaction.
 //
-// Because DB2 LUW SQL Replication represents UPDATE as a D+I pair, callers
-// will see two consecutive events for each logical update: a delete event
-// (before-image) followed by an insert event (after-image) sharing the same CSN.
-// BeforeData is reserved for a future pairing implementation and is always nil
-// in the current version.
+// For update events (Operation == OpTypeUpdate), pairOpcodeEvents merges the
+// D+I pair detected by the LEAD/LAG window query: BeforeData holds the
+// pre-update row and Data holds the post-update row.
 type ChangeEvent struct {
 	Schema     string         `json:"schema"`                // DB2 source schema (TABSCHEMA)
 	Table      string         `json:"table"`                 // DB2 source table name
-	Operation  OpType         `json:"operation"`             // insert / delete / read (update never emitted)
+	Operation  OpType         `json:"operation"`             // insert / delete / read / update
 	CSN        CSN            `json:"csn"`                   // log position; NullCSN for snapshot rows
 	IntentSeq  int64          `json:"intent_seq"`            // IBMSNAP_INTENTSEQ, tie-breaks within a CSN
 	Timestamp  time.Time      `json:"timestamp"`             // IBMSNAP_LOGMARKER from the change table
 	Data       map[string]any `json:"data"`                  // after-image column values (always present)
-	BeforeData map[string]any `json:"before_data,omitempty"` // reserved; always nil in current implementation
+	BeforeData map[string]any `json:"before_data,omitempty"` // pre-update row for OpTypeUpdate; nil for all other operations
 }
 
 // String returns a JSON representation of the event
