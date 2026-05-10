@@ -118,7 +118,7 @@ db2_cdc:
   dsn: %q
   schema: "DB2INST1"
   tables: ["CDC_TEST_EMPLOYEES"]
-  stream_snapshot: true
+  snapshot_mode: initial
   snapshot_max_batch_size: 10
   poll_batch_size: 100
   stream_backoff_interval: 500ms
@@ -259,7 +259,7 @@ db2_cdc:
   dsn: %q
   schema: "DB2INST1"
   tables: ["CDC_UPDATE_TEST"]
-  stream_snapshot: false
+  snapshot_mode: never
   poll_batch_size: 100
   stream_backoff_interval: 200ms
   checkpoint_cache_table_name: "DB2INST1.CDC_UPDATE_CHECKPOINT"

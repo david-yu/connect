@@ -860,7 +860,7 @@ func TestStreamingSkipsSnapshotWhenCheckpointExists(t *testing.T) {
 		db:                 db,
 		cpCacheTableName:   "RPCN.CDC_CHECKPOINT",
 		checkpointCacheKey: "db2_cdc_checkpoint",
-		streamSnapshot:     true, // snapshot is enabled in config
+		snapshotMode: snapshotModeInitial, // snapshot is enabled in config
 		streamConfig: replication.StreamConfig{
 			Schema:        "DB2INST1",
 			Tables:        []string{"EMPLOYEES"},
@@ -877,12 +877,56 @@ func TestStreamingSkipsSnapshotWhenCheckpointExists(t *testing.T) {
 	d.streamConfig.StartingCSN = csn
 
 	// With a saved checkpoint, StartingCSN is set to savedCSN.
-	// runCDC skips the snapshot when: streamSnapshot && StartingCSN.IsNull().
+	// runCDC skips the snapshot for snapshotModeInitial when StartingCSN is not null.
 	// Since StartingCSN is NOT null, the snapshot must be skipped.
 	assert.False(t, d.streamConfig.StartingCSN.IsNull(),
 		"after checkpoint resume, StartingCSN must not be null so snapshot is skipped")
 	assert.Equal(t, savedCSN.Uint64(), d.streamConfig.StartingCSN.Uint64(),
 		"StartingCSN must equal the saved checkpoint (poll uses >, so no double-increment needed)")
+}
+
+// TestSnapshotModes verifies the doSnapshot decision for each snapshot_mode value.
+func TestSnapshotModes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		mode           snapshotMode
+		hasCheckpoint  bool
+		expectSnapshot bool
+	}{
+		{"initial_no_checkpoint", snapshotModeInitial, false, true},
+		{"initial_with_checkpoint", snapshotModeInitial, true, false},
+		{"always_no_checkpoint", snapshotModeAlways, false, true},
+		{"always_with_checkpoint", snapshotModeAlways, true, true},
+		{"never_no_checkpoint", snapshotModeNever, false, false},
+		{"never_with_checkpoint", snapshotModeNever, true, false},
+		{"initial_only_no_checkpoint", snapshotModeInitialOnly, false, true},
+		{"initial_only_with_checkpoint", snapshotModeInitialOnly, true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var startCSN replication.CSN
+			if tc.hasCheckpoint {
+				startCSN = replication.NewCSN(12345)
+			} else {
+				startCSN = replication.NullCSN()
+			}
+			doSnapshot := false
+			switch tc.mode {
+			case snapshotModeInitial:
+				doSnapshot = startCSN.IsNull()
+			case snapshotModeAlways:
+				doSnapshot = true
+			case snapshotModeNever:
+				doSnapshot = false
+			case snapshotModeInitialOnly:
+				doSnapshot = true
+			}
+			assert.Equal(t, tc.expectSnapshot, doSnapshot)
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ const (
 	db2CDCFieldSchema                   = "schema"
 	db2CDCFieldTables                   = "tables"
 	db2CDCFieldCDCSchema                = "cdc_schema"
-	db2CDCFieldStreamSnapshot           = "stream_snapshot"
+	db2CDCFieldSnapshotMode             = "snapshot_mode"
 	db2CDCFieldSnapshotMaxBatchSize     = "snapshot_max_batch_size"
 	db2CDCFieldCheckpointMode           = "checkpoint_mode"
 	db2CDCFieldCheckpointCache          = "checkpoint_cache"
@@ -46,6 +46,15 @@ const (
 	// queued without back-pressure so that the CDC loop does not stall waiting for
 	// the consumer.
 	db2CDCEventChanBuf = 100
+)
+
+type snapshotMode string
+
+const (
+	snapshotModeInitial     snapshotMode = "initial"
+	snapshotModeAlways      snapshotMode = "always"
+	snapshotModeNever       snapshotMode = "never"
+	snapshotModeInitialOnly snapshotMode = "initial_only"
 )
 
 func db2CDCConfigSpec() *service.ConfigSpec {
@@ -64,7 +73,7 @@ DB2 SQL Replication maintains a set of *change tables* (also called CD tables) a
 
 The connector operates in two phases:
 
-1. *Snapshot* (when `+"`stream_snapshot: true`"+`): reads all existing rows from each monitored table inside a single `+"`REPEATABLE READ`"+` read-only transaction. The CDC position (CSN) is captured *before* the first row is read, so no changes are missed while the snapshot is in progress.
+1. *Snapshot* (when `+"`snapshot_mode: initial`"+` or `+"`always`"+`): reads all existing rows from each monitored table inside a single `+"`REPEATABLE READ`"+` read-only transaction. The CDC position (CSN) is captured *before* the first row is read, so no changes are missed while the snapshot is in progress.
 2. *Streaming*: polls each change table for new rows with `+"`IBMSNAP_COMMITSEQ`"+` greater than the last checkpoint. The maximum `+"`SYNCHPOINT`"+` from `+"`ASNCDC.IBMSNAP_REGISTER`"+` is used as an upper bound on every poll to avoid reading uncommitted rows.
 
 == UPDATE representation
@@ -160,12 +169,17 @@ The connector tracks the highest processed `+"`IBMSNAP_COMMITSEQ`"+` so it can r
 				Default("ASNCDC").
 				Advanced(),
 
-			service.NewBoolField(db2CDCFieldStreamSnapshot).
-				Description("When true, an initial full-table snapshot is performed before streaming CDC changes. "+
-					"All existing rows are read inside a single `REPEATABLE READ` read-only transaction. "+
-					"The CDC position (CSN) is captured before the first row is read so that no changes are missed during the snapshot. "+
-					"Set to false to skip the snapshot and start streaming from the current DB2 log position.").
-				Default(true),
+			service.NewStringEnumField(db2CDCFieldSnapshotMode,
+				string(snapshotModeInitial),
+				string(snapshotModeAlways),
+				string(snapshotModeNever),
+				string(snapshotModeInitialOnly)).
+				Description("Controls when an initial full-table snapshot is performed:\n\n"+
+					"- `initial` (default): snapshot only on first start (when no checkpoint exists). Skipped on restart.\n"+
+					"- `always`: snapshot on every start, regardless of existing checkpoint.\n"+
+					"- `never`: skip snapshot; start streaming from the current log position.\n"+
+					"- `initial_only`: snapshot then stop (no streaming phase).").
+				Default(string(snapshotModeInitial)),
 
 			service.NewIntField(db2CDCFieldSnapshotMaxBatchSize).
 				Description("Number of rows fetched per round-trip during the initial snapshot. "+
@@ -248,8 +262,8 @@ type db2CDCInput struct {
 	dsn            string
 	schema         string
 	tables         []string
-	asnCDCSchema   string
-	streamSnapshot bool
+	asnCDCSchema string
+	snapshotMode snapshotMode
 	checkpointMode string
 
 	checkpointCacheKey string
@@ -316,10 +330,11 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 		return nil, fmt.Errorf("cdc_schema %q contains invalid characters: only uppercase letters, digits, and underscores are allowed", asnCDCSchema)
 	}
 
-	streamSnapshot, err := conf.FieldBool(db2CDCFieldStreamSnapshot)
+	snapshotModeStr, err := conf.FieldString(db2CDCFieldSnapshotMode)
 	if err != nil {
 		return nil, err
 	}
+	mode := snapshotMode(snapshotModeStr)
 
 	snapshotMaxBatchSize, err := conf.FieldInt(db2CDCFieldSnapshotMaxBatchSize)
 	if err != nil {
@@ -377,9 +392,9 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 		dsn:                dsn,
 		schema:             schema,
 		tables:             tables,
-		asnCDCSchema:       asnCDCSchema,
-		streamSnapshot:     streamSnapshot,
-		checkpointMode:     checkpointMode,
+		asnCDCSchema:   asnCDCSchema,
+		snapshotMode:   mode,
+		checkpointMode: checkpointMode,
 		checkpointCacheKey: checkpointCacheKey,
 		checkpointLimit:    checkpointLimit,
 		cpCacheName:        cpCacheName,
@@ -604,7 +619,19 @@ func (d *db2CDCInput) Close(ctx context.Context) error {
 func (d *db2CDCInput) runCDC(ctx context.Context) {
 	defer d.wg.Done()
 
-	if d.streamSnapshot && d.streamConfig.StartingCSN.IsNull() {
+	doSnapshot := false
+	switch d.snapshotMode {
+	case snapshotModeInitial:
+		doSnapshot = d.streamConfig.StartingCSN.IsNull()
+	case snapshotModeAlways:
+		doSnapshot = true
+	case snapshotModeNever:
+		doSnapshot = false
+	case snapshotModeInitialOnly:
+		doSnapshot = true
+	}
+
+	if doSnapshot {
 		d.log.Info("Starting snapshot phase")
 		if err := d.runSnapshot(ctx); err != nil {
 			if ctx.Err() == nil && !d.shutSig.IsSoftStopSignalled() {
@@ -616,6 +643,10 @@ func (d *db2CDCInput) runCDC(ctx context.Context) {
 			return
 		}
 		d.log.Info("Snapshot complete")
+		if d.snapshotMode == snapshotModeInitialOnly {
+			d.log.Info("snapshot_mode=initial_only: stopping after snapshot")
+			return
+		}
 	}
 
 	d.log.Info("Starting streaming phase")
