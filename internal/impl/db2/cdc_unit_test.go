@@ -1029,3 +1029,45 @@ func TestEventToMessageHeartbeat(t *testing.T) {
 	assert.NotContains(t, envelope, "after")
 	assert.NotContains(t, envelope, "source")
 }
+
+// ---------------------------------------------------------------------------
+// eventToMessage — schema change
+// ---------------------------------------------------------------------------
+
+func TestEventToMessageSchemaChange(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	event := replication.ChangeEvent{
+		Schema:    "DB2INST1",
+		Table:     "NEW_TABLE",
+		Operation: replication.OpTypeSchemaChange,
+		CSN:       replication.NewCSN(12345),
+		Timestamp: ts,
+	}
+
+	d := &db2CDCInput{}
+	msg, err := d.eventToMessage(event)
+	require.NoError(t, err)
+
+	b, err := msg.AsBytes()
+	require.NoError(t, err)
+
+	var envelope map[string]any
+	require.NoError(t, json.Unmarshal(b, &envelope))
+
+	assert.Equal(t, "schema_change", envelope["op"])
+	assert.Equal(t, float64(ts.UnixMilli()), envelope["ts_ms"])
+
+	src, ok := envelope["source"].(map[string]any)
+	require.True(t, ok, "source must be a map")
+	assert.Equal(t, "DB2INST1", src["schema"])
+	assert.Equal(t, "NEW_TABLE", src["table"])
+
+	schemaVal, _ := msg.MetaGet("db2_schema")
+	assert.Equal(t, "DB2INST1", schemaVal)
+	tableVal, _ := msg.MetaGet("db2_table")
+	assert.Equal(t, "NEW_TABLE", tableVal)
+	opVal, _ := msg.MetaGet("db2_operation")
+	assert.Equal(t, "schema_change", opVal)
+}

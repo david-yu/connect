@@ -44,6 +44,7 @@ const (
 	db2CDCFieldStreamBackoffInterval    = "stream_backoff_interval"
 	db2CDCFieldPollBatchSize            = "poll_batch_size"
 	db2CDCFieldHeartbeatInterval        = "heartbeat_interval"
+	db2CDCFieldEmitSchemaChanges        = "emit_schema_changes"
 
 	// db2CDCEventChanBuf is the number of change events buffered between the
 	// background CDC goroutine and ReadBatch. Sized to allow one poll batch to be
@@ -275,6 +276,13 @@ The connector tracks the highest processed `+"`IBMSNAP_COMMITSEQ`"+` so it can r
 				Default("0s").
 				Advanced(),
 
+			service.NewBoolField(db2CDCFieldEmitSchemaChanges).
+				Description("When true, emit a schema change event (`op=schema_change`) whenever a new table is added to SQL Replication "+
+					"(i.e., when `ASNCDC.ADDTABLE` is called while the connector is running). "+
+					"The connector polls `ASNCDC.IBMSNAP_REGISTER` for new entries on each backoff interval.").
+				Default(false).
+				Advanced(),
+
 			service.NewAutoRetryNacksToggleField(),
 			service.NewBatchPolicyField("batching"),
 		)
@@ -301,7 +309,9 @@ type db2CDCInput struct {
 	cpCacheName        string // external cache resource name; empty = use DB2 table
 	cpCacheTableName   string
 
-	heartbeatInterval time.Duration
+	heartbeatInterval  time.Duration
+	emitSchemaChanges  bool
+	lastSeenSynchCSN   replication.CSN
 
 	snapshotConfig replication.SnapshotConfig
 	streamConfig   replication.StreamConfig
@@ -451,6 +461,11 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 		return nil, err
 	}
 
+	emitSchemaChanges, err := conf.FieldBool(db2CDCFieldEmitSchemaChanges)
+	if err != nil {
+		return nil, err
+	}
+
 	tableFilterFn := tableFilter.Matches
 
 	d := &db2CDCInput{
@@ -459,6 +474,8 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 		tables:             tables,
 		tableFilter:       tableFilter,
 		heartbeatInterval: heartbeatInterval,
+		emitSchemaChanges: emitSchemaChanges,
+		lastSeenSynchCSN:  replication.NullCSN(),
 		asnCDCSchema:   asnCDCSchema,
 		snapshotMode:   mode,
 		checkpointMode: checkpointMode,
@@ -765,6 +782,10 @@ func (d *db2CDCInput) runStreaming(ctx context.Context) error {
 		go d.runHeartbeat(ctx)
 	}
 
+	if d.emitSchemaChanges {
+		go d.pollSchemaChanges(ctx)
+	}
+
 	handler := func(event replication.ChangeEvent) error {
 		select {
 		case d.eventChan <- event:
@@ -802,6 +823,68 @@ func (d *db2CDCInput) runHeartbeat(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (d *db2CDCInput) pollSchemaChanges(ctx context.Context) {
+	ticker := time.NewTicker(d.streamConfig.BackoffInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := d.checkForSchemaChanges(ctx); err != nil {
+				d.log.Warnf("schema change poll: %v", err)
+			}
+		case <-ctx.Done():
+			return
+		case <-d.shutSig.SoftStopChan():
+			return
+		}
+	}
+}
+
+func (d *db2CDCInput) checkForSchemaChanges(ctx context.Context) error {
+	byteLen := 10
+	lastHex := d.lastSeenSynchCSN.SQLHex(byteLen)
+
+	// Ported from Debezium LuwPlatform.java getListOfNewCdcEnabledTablesQuery.
+	// Finds tables added to SQL Replication after the last known SYNCHPOINT.
+	query := fmt.Sprintf(`
+		SELECT r.SOURCE_OWNER, r.SOURCE_TABLE, r.CD_NEW_SYNCHPOINT
+		FROM %s.IBMSNAP_REGISTER r
+		WHERE r.SOURCE_OWNER = '%s'
+		  AND r.CD_NEW_SYNCHPOINT > X'%s'
+		ORDER BY r.CD_NEW_SYNCHPOINT
+	`, d.asnCDCSchema, d.schema, lastHex)
+
+	rows, err := d.db.QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("querying schema changes: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var srcOwner, srcTable string
+		var synchBytes []byte
+		if err := rows.Scan(&srcOwner, &srcTable, &synchBytes); err != nil {
+			continue
+		}
+		csn := replication.NewCSNFromDBValue(synchBytes)
+		d.lastSeenSynchCSN = csn
+
+		event := replication.ChangeEvent{
+			Schema:    strings.TrimSpace(srcOwner),
+			Table:     strings.TrimSpace(srcTable),
+			Operation: replication.OpTypeSchemaChange,
+			CSN:       csn,
+			Timestamp: time.Now().UTC(),
+		}
+		select {
+		case d.eventChan <- event:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return rows.Err()
 }
 
 // debeziumOp maps a replication.OpType to the single-character Debezium operation code
@@ -881,6 +964,26 @@ func (*db2CDCInput) eventToMessage(event replication.ChangeEvent) (*service.Mess
 		msg.SetStructuredMut(envelope)
 		msg.MetaSetMut("db2_operation", "heartbeat")
 		msg.MetaSetMut("db2_op", "hb")
+		return msg, nil
+	}
+
+	if event.Operation == replication.OpTypeSchemaChange {
+		tsMs := event.Timestamp.UnixMilli()
+		envelope := map[string]any{
+			"op": "schema_change",
+			"source": map[string]any{
+				"schema": event.Schema,
+				"table":  event.Table,
+				"csn":    event.CSN.String(),
+				"ts_ms":  tsMs,
+			},
+			"ts_ms": tsMs,
+		}
+		msg := service.NewMessage(nil)
+		msg.SetStructuredMut(envelope)
+		msg.MetaSetMut("db2_operation", "schema_change")
+		msg.MetaSetMut("db2_schema", event.Schema)
+		msg.MetaSetMut("db2_table", event.Table)
 		return msg, nil
 	}
 

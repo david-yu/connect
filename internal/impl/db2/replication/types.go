@@ -291,6 +291,10 @@ const (
 // Used to keep downstream consumers alive on low-traffic tables.
 const OpTypeHeartbeat OpType = "heartbeat"
 
+// OpTypeSchemaChange is emitted when a new table is added to SQL Replication
+// (i.e., when ASNCDC.ADDTABLE is called while the connector is running).
+const OpTypeSchemaChange OpType = "schema_change"
+
 // FromDB2Op converts a DB2 IBMSNAP_OPERATION code to an OpType.
 //
 // DB2 LUW SQL Replication uses three operation codes:
