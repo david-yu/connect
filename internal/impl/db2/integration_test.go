@@ -340,3 +340,95 @@ db2_cdc:
 	}, 2*time.Minute, 500*time.Millisecond,
 		"expected UPDATE event with op='u', before.NAME='original', after.NAME='updated'")
 }
+
+// TestIntegrationDB2CDCIncrementalSnapshot verifies that inserting an execute-snapshot
+// signal row triggers an ad-hoc re-snapshot of the specified table.
+func TestIntegrationDB2CDCIncrementalSnapshot(t *testing.T) {
+	integration.CheckSkip(t)
+
+	db := db2test.SetupTest(t)
+	ctx := t.Context()
+
+	_, _ = db.ExecContext(ctx, `DROP TABLE ASNCDC."CDC_DB2INST1_INC_SNAP_TEST"`)
+	_, _ = db.ExecContext(ctx, `DELETE FROM ASNCDC.IBMSNAP_PRUNCNTL WHERE SOURCE_TABLE='INC_SNAP_TEST'`)
+	_, _ = db.ExecContext(ctx, `DELETE FROM ASNCDC.IBMSNAP_REGISTER WHERE SOURCE_TABLE='INC_SNAP_TEST'`)
+	_, _ = db.ExecContext(ctx, `DROP TABLE DB2INST1.INC_SNAP_TEST`)
+	_, _ = db.ExecContext(ctx, `DROP TABLE DB2INST1.INC_SNAP_CHECKPOINT`)
+	_, _ = db.ExecContext(ctx, `DROP TABLE DB2INST1.CDC_SIGNALS`)
+
+	db.MustExecContext(ctx, `CREATE TABLE DB2INST1.INC_SNAP_TEST (ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(100))`)
+	db.MustExecContext(ctx, `INSERT INTO DB2INST1.INC_SNAP_TEST (ID, NAME) VALUES (1, 'row-1')`)
+	db.MustExecContext(ctx, `INSERT INTO DB2INST1.INC_SNAP_TEST (ID, NAME) VALUES (2, 'row-2')`)
+	db.EnableASNCDC("DB2INST1", []string{"INC_SNAP_TEST"})
+
+	connectorYAML := fmt.Sprintf(`
+db2_cdc:
+  dsn: %q
+  schema: "DB2INST1"
+  tables: ["INC_SNAP_TEST"]
+  snapshot_mode: never
+  poll_batch_size: 100
+  stream_backoff_interval: 500ms
+  checkpoint_cache_table_name: "DB2INST1.INC_SNAP_CHECKPOINT"
+  signal_table: "DB2INST1.CDC_SIGNALS"
+`, db.DSN)
+
+	var (
+		received   []string
+		receivedMu sync.Mutex
+	)
+
+	streamBuilder := service.NewStreamBuilder()
+	require.NoError(t, streamBuilder.AddInputYAML(connectorYAML))
+	require.NoError(t, streamBuilder.AddBatchConsumerFunc(func(_ context.Context, batch service.MessageBatch) error {
+		receivedMu.Lock()
+		defer receivedMu.Unlock()
+		for _, msg := range batch {
+			b, err := msg.AsBytes()
+			if err != nil {
+				continue
+			}
+			op, _ := msg.MetaGet("db2_operation")
+			t.Logf("CDC event [%s]: %s", op, b)
+			received = append(received, string(b))
+		}
+		return nil
+	}))
+
+	stream, err := streamBuilder.Build()
+	require.NoError(t, err)
+	license.InjectTestService(stream.Resources())
+
+	streamDone := make(chan error, 1)
+	go func() {
+		streamDone <- stream.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		if err := stream.StopWithin(10 * time.Second); err != nil {
+			t.Logf("stream stop: %v", err)
+		}
+		if err := <-streamDone; err != nil && !errors.Is(err, context.Canceled) {
+			t.Logf("stream error: %v", err)
+		}
+	})
+
+	// Let streaming stabilize (snapshot_mode=never so no initial events).
+	time.Sleep(5 * time.Second)
+
+	receivedMu.Lock()
+	initialCount := len(received)
+	receivedMu.Unlock()
+	t.Logf("events before signal: %d", initialCount)
+
+	// Insert execute-snapshot signal.
+	db.MustExecContext(ctx,
+		`INSERT INTO DB2INST1.CDC_SIGNALS (ID, TYPE, DATA) VALUES ('sig-1', 'execute-snapshot', '{"data-collections":["DB2INST1.INC_SNAP_TEST"]}')`)
+
+	// Wait for the re-snapshot to deliver the 2 pre-existing rows.
+	assert.Eventually(t, func() bool {
+		receivedMu.Lock()
+		defer receivedMu.Unlock()
+		return len(received)-initialCount >= 2
+	}, 2*time.Minute, 500*time.Millisecond,
+		"incremental snapshot: expected at least 2 events after execute-snapshot signal")
+}

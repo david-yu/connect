@@ -860,7 +860,7 @@ func TestStreamingSkipsSnapshotWhenCheckpointExists(t *testing.T) {
 		db:                 db,
 		cpCacheTableName:   "RPCN.CDC_CHECKPOINT",
 		checkpointCacheKey: "db2_cdc_checkpoint",
-		snapshotMode: snapshotModeInitial, // snapshot is enabled in config
+		snapshotMode:       snapshotModeInitial, // snapshot is enabled in config
 		streamConfig: replication.StreamConfig{
 			Schema:        "DB2INST1",
 			Tables:        []string{"EMPLOYEES"},
@@ -994,7 +994,6 @@ func TestEventToMessageHeartbeat(t *testing.T) {
 	opCode, _ := msg.MetaGet("db2_op")
 	assert.Equal(t, "hb", opCode)
 
-
 	schemaVal, schemaExists := msg.MetaGet("db2_schema")
 	assert.True(t, schemaExists, "db2_schema must be set on heartbeat")
 	assert.Empty(t, schemaVal)
@@ -1022,7 +1021,6 @@ func TestEventToMessageHeartbeat(t *testing.T) {
 	tsVal, tsExists := msg.MetaGet("db2_timestamp")
 	assert.True(t, tsExists, "db2_timestamp must be set when Timestamp is non-zero")
 	assert.Equal(t, ts.Format(time.RFC3339Nano), tsVal)
-
 
 	// Heartbeat must not have before/after/source fields.
 	assert.NotContains(t, envelope, "before")
@@ -1070,4 +1068,77 @@ func TestEventToMessageSchemaChange(t *testing.T) {
 	assert.Equal(t, "NEW_TABLE", tableVal)
 	opVal, _ := msg.MetaGet("db2_operation")
 	assert.Equal(t, "schema_change", opVal)
+
+	opCode, opCodeExists := msg.MetaGet("db2_op")
+	assert.True(t, opCodeExists, "db2_op must be set on schema_change")
+	assert.Equal(t, "schema_change", opCode)
+
+	expectedCSN := replication.NewCSN(12345).String()
+	csnVal, csnExists := msg.MetaGet("db2_csn")
+	assert.True(t, csnExists, "db2_csn must be set on schema_change")
+	assert.Equal(t, expectedCSN, csnVal)
+
+	commitLSN, commitLSNExists := msg.MetaGet("db2_commit_lsn")
+	assert.True(t, commitLSNExists, "db2_commit_lsn must be set on schema_change")
+	assert.Equal(t, expectedCSN, commitLSN)
+
+	connector, connectorExists := msg.MetaGet("db2_connector")
+	assert.True(t, connectorExists, "db2_connector must be set on schema_change")
+	assert.Equal(t, "db2", connector)
+
+	snapshot, snapshotExists := msg.MetaGet("db2_snapshot")
+	assert.True(t, snapshotExists, "db2_snapshot must be set on schema_change")
+	assert.Equal(t, "false", snapshot)
+
+	tsVal, tsExists := msg.MetaGet("db2_timestamp")
+	assert.True(t, tsExists, "db2_timestamp must be set when Timestamp is non-zero")
+	assert.Equal(t, ts.Format(time.RFC3339Nano), tsVal)
+}
+
+// ---------------------------------------------------------------------------
+// parseSnapshotSignalTables
+// ---------------------------------------------------------------------------
+
+func TestParseSnapshotSignalTables(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data string
+		want []string
+	}{
+		{
+			name: "json data-collections with schema prefix",
+			data: `{"data-collections":["DB2INST1.EMPLOYEES","DB2INST1.ORDERS"]}`,
+			want: []string{"EMPLOYEES", "ORDERS"},
+		},
+		{
+			name: "json data-collections bare names",
+			data: `{"data-collections":["EMPLOYEES"]}`,
+			want: []string{"EMPLOYEES"},
+		},
+		{
+			name: "comma-separated with schema",
+			data: "DB2INST1.EMPLOYEES, DB2INST1.ORDERS",
+			want: []string{"EMPLOYEES", "ORDERS"},
+		},
+		{
+			name: "comma-separated bare names",
+			data: "EMPLOYEES,ORDERS",
+			want: []string{"EMPLOYEES", "ORDERS"},
+		},
+		{
+			name: "empty data",
+			data: "",
+			want: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := parseSnapshotSignalTables(tc.data)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

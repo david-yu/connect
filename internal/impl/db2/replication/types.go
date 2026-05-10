@@ -447,12 +447,6 @@ func (v Version) SupportsCDC() bool {
 	return v.AtLeast(10, 1)
 }
 
-// SupportsEventStore returns true if the version supports Event Store (newer CDC)
-func (v Version) SupportsEventStore() bool {
-	// DB2 11.5+ has Event Store
-	return v.AtLeast(11, 5)
-}
-
 // ChangeEvent is a single CDC event produced by the DB2 SQL Replication capture
 // daemon and emitted as a Redpanda Connect message.
 //
@@ -471,7 +465,7 @@ type ChangeEvent struct {
 	CSN        CSN            `json:"csn"`                   // log position; NullCSN for snapshot rows
 	IntentSeq  int64          `json:"intent_seq"`            // IBMSNAP_INTENTSEQ, tie-breaks within a CSN
 	Timestamp  time.Time      `json:"timestamp"`             // IBMSNAP_LOGMARKER from the change table
-	Data       map[string]any `json:"data"`                  // after-image column values (always present)
+	Data       map[string]any `json:"data"`                  // row column values; for INSERT/UPDATE: new row; for DELETE: deleted row
 	BeforeData map[string]any `json:"before_data,omitempty"` // pre-update row for OpTypeUpdate; nil for all other operations
 }
 

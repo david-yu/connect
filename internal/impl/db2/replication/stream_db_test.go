@@ -506,15 +506,14 @@ func TestPollChangeTableDeleteEvent(t *testing.T) {
 	assert.False(t, hasIBM, "IBMSNAP_* control columns must not appear in Data")
 }
 
-// TestPollChangeTableUpdateAsDIPair verifies that an UPDATE represented as a
-// D+I pair (both rows share the same IBMSNAP_COMMITSEQ) is returned as two
-// separate events: delete (before-image, intentseq=1) then insert (after-image,
-// intentseq=2).
+// TestPollChangeTableUpdateAsDIPair verifies that pollChangeTable correctly maps
+// IBMSNAP_OPERATION='D' and 'I' rows to OpTypeDelete and OpTypeInsert when no
+// IBMSNAP_OPCODE column is present (the non-LEAD/LAG fallback path).
 //
-// DB2 LUW SQL Replication encodes every UPDATE as a DELETE record followed
-// immediately by an INSERT record with the same IBMSNAP_COMMITSEQ value.
-// The connector emits both events separately. Consumers can reconstruct the
-// before/after image by correlating the pair on (csn, primary key).
+// In production the buildPollQuery LEAD/LAG subquery emits IBMSNAP_OPCODE 3/4 for
+// update pairs; pairOpcodeEvents then merges them into a single OpTypeUpdate event.
+// This test validates the fallback: when the result set has no IBMSNAP_OPCODE column,
+// pollChangeTable maps raw D/I IBMSNAP_OPERATION codes to OpTypeDelete/OpTypeInsert.
 func TestPollChangeTableUpdateAsDIPair(t *testing.T) {
 	t.Parallel()
 

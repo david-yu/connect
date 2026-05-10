@@ -11,6 +11,7 @@ package db2
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -45,6 +46,7 @@ const (
 	db2CDCFieldPollBatchSize            = "poll_batch_size"
 	db2CDCFieldHeartbeatInterval        = "heartbeat_interval"
 	db2CDCFieldEmitSchemaChanges        = "emit_schema_changes"
+	db2CDCFieldSignalTable              = "signal_table"
 
 	// db2CDCEventChanBuf is the number of change events buffered between the
 	// background CDC goroutine and ReadBatch. Sized to allow one poll batch to be
@@ -83,7 +85,7 @@ The connector operates in two phases:
 
 == UPDATE representation
 
-DB2 LUW SQL Replication encodes UPDATE operations as a DELETE record followed by an INSERT record that share the same `+"`IBMSNAP_COMMITSEQ`"+` value. This connector detects these pairs using window functions and merges them into a single `+"`op: u`"+` (update) event with the `+"`before`"+` field populated with the old row data and `+"`after`"+` with the new row data.
+DB2 LUW SQL Replication encodes UPDATE operations as a DELETE record followed by an INSERT record that share the same `+"`IBMSNAP_COMMITSEQ`"+` value. This connector detects these pairs using LEAD/LAG window functions (ported from the Debezium DB2 connector) and merges them into a single `+"`op: u`"+` (update) event. The `+"`before`"+` field contains the old row data and `+"`after`"+` contains the new row data.
 
 == Message format (Debezium-compatible)
 
@@ -108,7 +110,7 @@ The message body matches the https://debezium.io/documentation/reference/stable/
 }
 `+"```"+`
 
-`+"**`op` codes**"+` match Debezium: `+"`c`"+` = create/insert, `+"`u`"+` = update, `+"`d`"+` = delete, `+"`r`"+` = read (snapshot).
+`+"**`op` codes**"+` match Debezium: `+"`c`"+` = create/insert, `+"`u`"+` = update, `+"`d`"+` = delete, `+"`r`"+` = read (snapshot), `+"`hb`"+` = heartbeat, `+"`schema_change`"+` = schema change.
 
 `+"**`before` field**"+`: Populated per Debezium semantics. For `+"`op: u`"+` (update) events, `+"`before`"+` contains the old row data and `+"`after`"+` contains the new row data. For `+"`op: d`"+` (delete) events, `+"`before`"+` contains the deleted row and `+"`after`"+` is `+"`null`"+`. For `+"`op: c`"+` (insert) and `+"`op: r`"+` (snapshot read) events, `+"`before`"+` is `+"`null`"+`.
 
@@ -118,8 +120,8 @@ The following metadata keys are set on every message:
 
 - `+"`db2_schema`"+`: source table schema
 - `+"`db2_table`"+`: source table name
-- `+"`db2_operation`"+`: human-readable op — `+"`read`"+`, `+"`insert`"+`, `+"`update`"+`, or `+"`delete`"+`
-- `+"`db2_op`"+`: Debezium op code — `+"`r`"+`, `+"`c`"+`, `+"`u`"+`, or `+"`d`"+`
+- `+"`db2_operation`"+`: human-readable op — `+"`read`"+`, `+"`insert`"+`, `+"`update`"+`, `+"`delete`"+`, `+"`heartbeat`"+`, or `+"`schema_change`"+`
+- `+"`db2_op`"+`: Debezium op code — `+"`r`"+`, `+"`c`"+`, `+"`u`"+`, `+"`d`"+`, `+"`hb`"+`, or `+"`schema_change`"+`
 - `+"`db2_csn`"+`: commit sequence number string (empty for snapshot events; backward-compat alias for `+"`db2_commit_lsn`"+`)
 - `+"`db2_commit_lsn`"+`: same as `+"`db2_csn`"+` (Debezium field name)
 - `+"`db2_connector`"+`: always `+"`db2`"+`
@@ -130,9 +132,42 @@ The following metadata keys are set on every message:
 
 1. IBM DB2 10.1 or later with SQL Replication installed.
 2. The DB2 CLI shared library must be present at runtime:
-   - Linux: `+"`libdb2.so.1`"+`
+   - Linux: `+"`libdb2.so.1`"+` (from the IBM Data Server Driver package)
    - macOS: `+"`libdb2.dylib`"+`
    - Windows: `+"`db2cli.dll`"+`
+
+=== Installing on Debian/Ubuntu
+
+Download the IBM Data Server Driver Package (dsdriver) from the IBM support site and run:
+
+`+"```sh"+`
+tar xzf ibm_data_server_driver_package_linuxx64.tar.gz
+cd dsdriver && bash installDSDriver
+export LD_LIBRARY_PATH=/opt/ibm/dsdriver/lib:$LD_LIBRARY_PATH
+`+"```"+`
+
+=== Installing on RHEL/CentOS
+
+`+"```sh"+`
+rpm -ivh ibm-datasrvrmgr-*.rpm
+export LD_LIBRARY_PATH=/opt/ibm/dsdriver/lib:$LD_LIBRARY_PATH
+`+"```"+`
+
+=== Kubernetes init container
+
+`+"```yaml"+`
+initContainers:
+  - name: install-db2-driver
+    image: ibmcom/db2:11.5.9.0
+    command: ["/bin/sh", "-c", "cp /opt/ibm/db2/V11.5/lib64/libdb2.so.1 /shared/lib/"]
+    volumeMounts:
+      - name: db2-lib
+        mountPath: /shared/lib
+volumes:
+  - name: db2-lib
+    emptyDir: {}
+`+"```"+`
+
 3. SQL Replication must be configured and the capture daemon running:
 `+"```sql"+`
 -- Start the CDC capture daemon
@@ -283,6 +318,15 @@ The connector tracks the highest processed `+"`IBMSNAP_COMMITSEQ`"+` so it can r
 				Default(false).
 				Advanced(),
 
+			service.NewStringField(db2CDCFieldSignalTable).
+				Description("Fully-qualified DB2 table name for the signal channel (e.g. `DB2INST1.CDC_SIGNALS`). "+
+					"When set, the connector polls this table for `execute-snapshot` signals. "+
+					"An `execute-snapshot` signal triggers an ad-hoc snapshot of the specified tables without restarting the connector. "+
+					"Create the table with: "+
+					"`CREATE TABLE <schema>.<table> (ID VARCHAR(255) NOT NULL, TYPE VARCHAR(64) NOT NULL, DATA VARCHAR(2048), PRIMARY KEY (ID))`").
+				Optional().
+				Advanced(),
+
 			service.NewAutoRetryNacksToggleField(),
 			service.NewBatchPolicyField("batching"),
 		)
@@ -296,12 +340,13 @@ func init() {
 
 type db2CDCInput struct {
 	db             *sql.DB
+	auxDB          *sql.DB // dedicated connection for signals, schema changes, incremental snapshots
 	dsn            string
 	schema         string
 	tables         []string
 	tableFilter    *confx.RegexpFilter
-	asnCDCSchema string
-	snapshotMode snapshotMode
+	asnCDCSchema   string
+	snapshotMode   snapshotMode
 	checkpointMode string
 
 	checkpointCacheKey string
@@ -309,9 +354,10 @@ type db2CDCInput struct {
 	cpCacheName        string // external cache resource name; empty = use DB2 table
 	cpCacheTableName   string
 
-	heartbeatInterval  time.Duration
-	emitSchemaChanges  bool
-	lastSeenSynchCSN   replication.CSN
+	heartbeatInterval time.Duration
+	emitSchemaChanges bool
+	lastSeenSynchCSN  replication.CSN
+	signalTable       string
 
 	snapshotConfig replication.SnapshotConfig
 	streamConfig   replication.StreamConfig
@@ -466,19 +512,31 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 		return nil, err
 	}
 
+	var signalTable string
+	if conf.Contains(db2CDCFieldSignalTable) {
+		if signalTable, err = conf.FieldString(db2CDCFieldSignalTable); err != nil {
+			return nil, err
+		}
+		signalTable = strings.ToUpper(signalTable)
+		if err := validateQualifiedIdentifier(signalTable); err != nil {
+			return nil, fmt.Errorf("signal_table %q: %w", signalTable, err)
+		}
+	}
+
 	tableFilterFn := tableFilter.Matches
 
 	d := &db2CDCInput{
 		dsn:                dsn,
 		schema:             schema,
 		tables:             tables,
-		tableFilter:       tableFilter,
-		heartbeatInterval: heartbeatInterval,
-		emitSchemaChanges: emitSchemaChanges,
-		lastSeenSynchCSN:  replication.NullCSN(),
-		asnCDCSchema:   asnCDCSchema,
-		snapshotMode:   mode,
-		checkpointMode: checkpointMode,
+		tableFilter:        tableFilter,
+		heartbeatInterval:  heartbeatInterval,
+		emitSchemaChanges:  emitSchemaChanges,
+		lastSeenSynchCSN:   replication.NullCSN(),
+		signalTable:        signalTable,
+		asnCDCSchema:       asnCDCSchema,
+		snapshotMode:       mode,
+		checkpointMode:     checkpointMode,
 		checkpointCacheKey: checkpointCacheKey,
 		checkpointLimit:    checkpointLimit,
 		cpCacheName:        cpCacheName,
@@ -569,8 +627,48 @@ func (d *db2CDCInput) Connect(ctx context.Context) error {
 		d.log.Infof("Using external cache %q for checkpoint persistence", d.cpCacheName)
 	}
 
+	// Open a dedicated auxiliary connection for out-of-band operations (signal
+	// polling, schema change detection, incremental snapshots). These run
+	// concurrently with the main CDC streaming loop, so they need their own
+	// connection pool to avoid starving d.db's single slot.
+	if d.signalTable != "" || d.emitSchemaChanges {
+		auxDB, err := sql.Open("db2-cli", d.dsn)
+		if err != nil {
+			d.db.Close()
+			d.db = nil
+			return fmt.Errorf("opening auxiliary DB2 connection: %w", err)
+		}
+		auxDB.SetMaxOpenConns(1)
+		auxDB.SetMaxIdleConns(1)
+		if err := auxDB.PingContext(ctx); err != nil {
+			auxDB.Close()
+			d.db.Close()
+			d.db = nil
+			return fmt.Errorf("pinging auxiliary DB2 connection: %w", err)
+		}
+		d.auxDB = auxDB
+	}
+
+	// Initialize signal table if configured.
+	if d.signalTable != "" {
+		if err := d.initSignalTable(ctx); err != nil {
+			if d.auxDB != nil {
+				d.auxDB.Close()
+				d.auxDB = nil
+			}
+			d.db.Close()
+			d.db = nil
+			return fmt.Errorf("initializing signal table: %w", err)
+		}
+		d.log.Infof("Using DB2 table %q for incremental snapshot signals", d.signalTable)
+	}
+
 	startingCSN, err := d.loadCheckpoint(ctx)
 	if err != nil {
+		if d.auxDB != nil {
+			d.auxDB.Close()
+			d.auxDB = nil
+		}
 		d.db.Close()
 		d.db = nil
 		return fmt.Errorf("loading checkpoint: %w", err)
@@ -691,6 +789,13 @@ func (d *db2CDCInput) Close(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	if d.auxDB != nil {
+		if err := d.auxDB.Close(); err != nil {
+			d.log.Errorf("error closing auxiliary DB2 connection: %v", err)
+		}
+		d.auxDB = nil
+	}
+
 	if d.db != nil {
 		if err := d.db.Close(); err != nil {
 			d.log.Errorf("error closing DB2 connection: %v", err)
@@ -779,11 +884,18 @@ func (d *db2CDCInput) runStreaming(ctx context.Context) error {
 	}
 
 	if d.heartbeatInterval > 0 {
+		d.wg.Add(1)
 		go d.runHeartbeat(ctx)
 	}
 
 	if d.emitSchemaChanges {
+		d.wg.Add(1)
 		go d.pollSchemaChanges(ctx)
+	}
+
+	if d.signalTable != "" {
+		d.wg.Add(1)
+		go d.pollSignals(ctx)
 	}
 
 	handler := func(event replication.ChangeEvent) error {
@@ -801,6 +913,7 @@ func (d *db2CDCInput) runStreaming(ctx context.Context) error {
 }
 
 func (d *db2CDCInput) runHeartbeat(ctx context.Context) {
+	defer d.wg.Done()
 	ticker := time.NewTicker(d.heartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -826,6 +939,7 @@ func (d *db2CDCInput) runHeartbeat(ctx context.Context) {
 }
 
 func (d *db2CDCInput) pollSchemaChanges(ctx context.Context) {
+	defer d.wg.Done()
 	ticker := time.NewTicker(d.streamConfig.BackoffInterval)
 	defer ticker.Stop()
 	for {
@@ -856,7 +970,7 @@ func (d *db2CDCInput) checkForSchemaChanges(ctx context.Context) error {
 		ORDER BY r.CD_NEW_SYNCHPOINT
 	`, d.asnCDCSchema, d.schema, lastHex)
 
-	rows, err := d.db.QueryContext(ctx, query)
+	rows, err := d.auxDB.QueryContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("querying schema changes: %w", err)
 	}
@@ -887,10 +1001,156 @@ func (d *db2CDCInput) checkForSchemaChanges(ctx context.Context) error {
 	return rows.Err()
 }
 
-// debeziumOp maps a replication.OpType to the single-character Debezium operation code
-// used in the "op" field of the Debezium envelope and in the db2_op metadata key.
+// initSignalTable creates the signal table in DB2 if it does not exist.
+func (d *db2CDCInput) initSignalTable(ctx context.Context) error {
+	if parts := strings.SplitN(d.signalTable, ".", 2); len(parts) == 2 {
+		_, _ = d.auxDB.ExecContext(ctx, "CREATE SCHEMA "+parts[0])
+	}
+	_, err := d.auxDB.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE %s (
+			ID   VARCHAR(255) NOT NULL,
+			TYPE VARCHAR(64)  NOT NULL,
+			DATA VARCHAR(2048),
+			PRIMARY KEY (ID)
+		)`, d.signalTable))
+	if err != nil && !isAlreadyExistsError(err) {
+		return fmt.Errorf("create signal table %s: %w", d.signalTable, err)
+	}
+	return nil
+}
+
+func (d *db2CDCInput) pollSignals(ctx context.Context) {
+	defer d.wg.Done()
+	ticker := time.NewTicker(d.streamConfig.BackoffInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := d.processSignals(ctx); err != nil {
+				d.log.Warnf("signal poll: %v", err)
+			}
+		case <-ctx.Done():
+			return
+		case <-d.shutSig.SoftStopChan():
+			return
+		}
+	}
+}
+
+func (d *db2CDCInput) processSignals(ctx context.Context) error {
+	if d.auxDB == nil {
+		return nil
+	}
+
+	// Collect all pending signals into memory first, then close the result set
+	// before calling runIncrementalSnapshot. This avoids a single-connection
+	// deadlock: the SELECT would hold the auxDB connection open while the
+	// snapshot transaction needs that same connection.
+	type pendingSignal struct {
+		id, data string
+	}
+	var pending []pendingSignal
+
+	rows, err := d.auxDB.QueryContext(ctx,
+		fmt.Sprintf("SELECT ID, DATA FROM %s WHERE TYPE = 'execute-snapshot' FETCH FIRST 10 ROWS ONLY",
+			d.signalTable))
+	if err != nil {
+		return fmt.Errorf("querying signals: %w", err)
+	}
+	for rows.Next() {
+		var id string
+		var data sql.NullString
+		if err := rows.Scan(&id, &data); err != nil {
+			continue
+		}
+		pending = append(pending, pendingSignal{id: id, data: data.String})
+	}
+	scanErr := rows.Err()
+	rows.Close() // release auxDB connection before snapshot
+	if scanErr != nil {
+		return scanErr
+	}
+
+	for _, sig := range pending {
+		tables := parseSnapshotSignalTables(sig.data)
+		d.log.Infof("received execute-snapshot signal id=%s tables=%v", sig.id, tables)
+		if err := d.runIncrementalSnapshot(ctx, tables); err != nil {
+			d.log.Warnf("incremental snapshot for signal %s: %v", sig.id, err)
+		}
+		_, _ = d.auxDB.ExecContext(ctx,
+			fmt.Sprintf("DELETE FROM %s WHERE ID = ? AND TYPE = 'execute-snapshot'", d.signalTable), sig.id)
+	}
+	return nil
+}
+
+func (d *db2CDCInput) runIncrementalSnapshot(ctx context.Context, tables []string) error {
+	cfg := replication.SnapshotConfig{
+		Schema:         d.schema,
+		Tables:         tables,
+		AsnCDCSchema:   d.asnCDCSchema,
+		BatchSize:      d.snapshotConfig.BatchSize,
+		IsolationLevel: "REPEATABLE READ",
+	}
+	snapshotter := replication.NewSnapshotter(d.auxDB, cfg, d.version)
+	handler := func(event replication.ChangeEvent) error {
+		select {
+		case d.eventChan <- event:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-d.shutSig.SoftStopChan():
+			return service.ErrEndOfInput
+		}
+	}
+	_, err := snapshotter.Snapshot(ctx, handler)
+	return err
+}
+
+// parseSnapshotSignalTables parses the DATA field of an execute-snapshot signal.
+// Accepts JSON {"data-collections":["SCHEMA.TABLE",...]} or bare table names.
+// Schema prefixes are stripped; the caller sets Schema separately in SnapshotConfig.
+func parseSnapshotSignalTables(data string) []string {
+	type signalData struct {
+		DataCollections []string `json:"data-collections"`
+	}
+	var sd signalData
+	if err := json.Unmarshal([]byte(data), &sd); err == nil && len(sd.DataCollections) > 0 {
+		tables := make([]string, 0, len(sd.DataCollections))
+		for _, t := range sd.DataCollections {
+			t = strings.ToUpper(t)
+			if parts := strings.SplitN(t, ".", 2); len(parts) == 2 {
+				tables = append(tables, parts[1])
+			} else {
+				tables = append(tables, t)
+			}
+		}
+		return tables
+	}
+	// Fallback: comma-separated table names.
+	if data == "" {
+		return nil
+	}
+	parts := strings.Split(data, ",")
+	tables := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(strings.ToUpper(p))
+		if p == "" {
+			continue
+		}
+		if dotParts := strings.SplitN(p, ".", 2); len(dotParts) == 2 {
+			tables = append(tables, dotParts[1])
+		} else {
+			tables = append(tables, p)
+		}
+	}
+	return tables
+}
+
+// debeziumOp maps a replication.OpType to the Debezium operation code used in the
+// "op" field of the Debezium envelope and in the db2_op metadata key.
 //
-// Debezium codes: c=create (insert), u=update, d=delete, r=read (snapshot).
+// Codes: c=insert, u=update, d=delete, r=snapshot read, hb=heartbeat.
+// schema_change and any unrecognised type fall through to the string value of op.
 func debeziumOp(op replication.OpType) string {
 	switch op {
 	case replication.OpTypeInsert:
@@ -964,6 +1224,15 @@ func (*db2CDCInput) eventToMessage(event replication.ChangeEvent) (*service.Mess
 		msg.SetStructuredMut(envelope)
 		msg.MetaSetMut("db2_operation", "heartbeat")
 		msg.MetaSetMut("db2_op", "hb")
+		msg.MetaSetMut("db2_schema", "")
+		msg.MetaSetMut("db2_table", "")
+		msg.MetaSetMut("db2_csn", "")
+		msg.MetaSetMut("db2_commit_lsn", "")
+		msg.MetaSetMut("db2_connector", "db2")
+		msg.MetaSetMut("db2_snapshot", "false")
+		if !event.Timestamp.IsZero() {
+			msg.MetaSetMut("db2_timestamp", event.Timestamp.Format(time.RFC3339Nano))
+		}
 		return msg, nil
 	}
 
@@ -984,6 +1253,15 @@ func (*db2CDCInput) eventToMessage(event replication.ChangeEvent) (*service.Mess
 		msg.MetaSetMut("db2_operation", "schema_change")
 		msg.MetaSetMut("db2_schema", event.Schema)
 		msg.MetaSetMut("db2_table", event.Table)
+		msg.MetaSetMut("db2_op", "schema_change")
+		csnStr := event.CSN.String()
+		msg.MetaSetMut("db2_csn", csnStr)
+		msg.MetaSetMut("db2_commit_lsn", csnStr)
+		msg.MetaSetMut("db2_connector", "db2")
+		msg.MetaSetMut("db2_snapshot", "false")
+		if !event.Timestamp.IsZero() {
+			msg.MetaSetMut("db2_timestamp", event.Timestamp.Format(time.RFC3339Nano))
+		}
 		return msg, nil
 	}
 
@@ -1164,9 +1442,9 @@ func (d *db2CDCInput) saveCheckpoint(ctx context.Context, csn replication.CSN) e
 	return nil
 }
 
-// isAlreadyExistsError returns true for DB2 SQLSTATE 42710 (object already exists).
-// The substring "42710" can appear in many places; we only want to match the
-// SQLSTATE token specifically.
+// isAlreadyExistsError returns true when the DB2 error message contains SQLSTATE
+// 42710 (object already exists). Uses substring matching because DB2 CLI error
+// strings embed the SQLSTATE in two formats: "SQLSTATE=42710" and "SQLSTATE 42710".
 func isAlreadyExistsError(err error) bool {
 	if err == nil {
 		return false

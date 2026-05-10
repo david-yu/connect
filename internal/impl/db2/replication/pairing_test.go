@@ -30,9 +30,11 @@ func TestPairOpcodeEvents(t *testing.T) {
 				{CSN: csn100, IntentSeq: 2, Operation: opTypeUpdateAfter, Data: map[string]any{"ID": 1, "NAME": "new"}},
 			},
 			expect: []ChangeEvent{
-				{CSN: csn100, IntentSeq: 2, Operation: OpTypeUpdate,
+				{
+					CSN: csn100, IntentSeq: 2, Operation: OpTypeUpdate,
 					Data:       map[string]any{"ID": 1, "NAME": "new"},
-					BeforeData: map[string]any{"ID": 1, "NAME": "old"}},
+					BeforeData: map[string]any{"ID": 1, "NAME": "old"},
+				},
 			},
 		},
 		{
@@ -62,9 +64,11 @@ func TestPairOpcodeEvents(t *testing.T) {
 			},
 			expect: []ChangeEvent{
 				{CSN: csn100, IntentSeq: 1, Operation: OpTypeDelete, Data: map[string]any{"ID": 1}},
-				{CSN: csn100, IntentSeq: 3, Operation: OpTypeUpdate,
+				{
+					CSN: csn100, IntentSeq: 3, Operation: OpTypeUpdate,
 					Data:       map[string]any{"ID": 2, "NAME": "new"},
-					BeforeData: map[string]any{"ID": 2, "NAME": "old"}},
+					BeforeData: map[string]any{"ID": 2, "NAME": "old"},
+				},
 			},
 		},
 		{
@@ -76,10 +80,14 @@ func TestPairOpcodeEvents(t *testing.T) {
 				{CSN: csn100, IntentSeq: 4, Operation: opTypeUpdateAfter, Data: map[string]any{"ID": 2, "V": "y"}},
 			},
 			expect: []ChangeEvent{
-				{CSN: csn100, IntentSeq: 2, Operation: OpTypeUpdate,
-					Data: map[string]any{"ID": 1, "V": "b"}, BeforeData: map[string]any{"ID": 1, "V": "a"}},
-				{CSN: csn100, IntentSeq: 4, Operation: OpTypeUpdate,
-					Data: map[string]any{"ID": 2, "V": "y"}, BeforeData: map[string]any{"ID": 2, "V": "x"}},
+				{
+					CSN: csn100, IntentSeq: 2, Operation: OpTypeUpdate,
+					Data: map[string]any{"ID": 1, "V": "b"}, BeforeData: map[string]any{"ID": 1, "V": "a"},
+				},
+				{
+					CSN: csn100, IntentSeq: 4, Operation: OpTypeUpdate,
+					Data: map[string]any{"ID": 2, "V": "y"}, BeforeData: map[string]any{"ID": 2, "V": "x"},
+				},
 			},
 		},
 		{
