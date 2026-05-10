@@ -22,6 +22,8 @@ type SnapshotConfig struct {
 	AsnCDCSchema   string // CDC control schema, defaults to "ASNCDC"
 	BatchSize      int
 	IsolationLevel string // e.g. "REPEATABLE READ"
+	// TableFilter narrows which tables to snapshot. When nil all Tables are snapshotted.
+	TableFilter func(string) bool
 }
 
 // asncdcSchema returns the CDC control schema, defaulting to "ASNCDC".
@@ -123,6 +125,9 @@ func (s *Snapshotter) captureCurrentCSN(ctx context.Context, tx *sql.Tx) (CSN, e
 // snapshotTablesSequential snapshots tables one at a time.
 func (s *Snapshotter) snapshotTablesSequential(ctx context.Context, tx *sql.Tx, handler func(event ChangeEvent) error) error {
 	for _, tableName := range s.config.Tables {
+		if s.config.TableFilter != nil && !s.config.TableFilter(tableName) {
+			continue
+		}
 		if err := s.snapshotTable(ctx, tx, tableName, handler); err != nil {
 			return fmt.Errorf("snapshotting table %s: %w", tableName, err)
 		}

@@ -43,7 +43,7 @@ dsn: "DATABASE=SAMPLE;HOSTNAME=db2host;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PW
 schema: "DB2ADMIN"
 tables: ["EMPLOYEES", "ORDERS"]
 cdc_schema: "ASNCDC"
-stream_snapshot: false
+snapshot_mode: never
 checkpoint_cache_table_name: "MYSCHEMA.MY_CHECKPOINT"
 `,
 		},
@@ -91,7 +91,7 @@ dsn: "DATABASE=SAMPLE;HOSTNAME=db2host;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PW
 schema: "DB2ADMIN"
 tables: []
 `,
-			errContains: "at least one table",
+			errContains: "either tables or table_include_regex must be specified",
 		},
 		{
 			name: "snapshot_max_batch_size zero rejected",
@@ -295,4 +295,97 @@ func TestValidateQualifiedIdentifierEdgeCases(t *testing.T) {
 	assert.Error(t, validateQualifiedIdentifier("SCHEMA.bad-table"))
 	// Valid schema, valid uppercase table.
 	assert.NoError(t, validateQualifiedIdentifier("SCHEMA.TABLE_123"))
+}
+
+func TestTableRegexFilterConfig(t *testing.T) {
+	t.Parallel()
+
+	spec := db2CDCConfigSpec()
+
+	tests := []struct {
+		name        string
+		configYAML  string
+		errContains string
+	}{
+		{
+			name: "include_regex accepts matching tables",
+			configYAML: `
+dsn: "DATABASE=SAMPLE;HOSTNAME=db2host;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PWD=secret"
+schema: "DB2ADMIN"
+table_include_regex: ["^EMP"]
+`,
+		},
+		{
+			name: "tables empty with include_regex is valid",
+			configYAML: `
+dsn: "DATABASE=SAMPLE;HOSTNAME=db2host;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PWD=secret"
+schema: "DB2ADMIN"
+table_include_regex: ["^ORDERS"]
+`,
+		},
+		{
+			name: "both tables and exclude_regex is valid",
+			configYAML: `
+dsn: "DATABASE=SAMPLE;HOSTNAME=db2host;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PWD=secret"
+schema: "DB2ADMIN"
+tables: ["EMPLOYEES", "ORDERS_AUDIT"]
+table_exclude_regex: ["_AUDIT$"]
+`,
+		},
+		{
+			name: "invalid include_regex rejected",
+			configYAML: `
+dsn: "DATABASE=SAMPLE;HOSTNAME=db2host;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PWD=secret"
+schema: "DB2ADMIN"
+table_include_regex: ["[invalid"]
+`,
+			errContains: "table_include_regex",
+		},
+		{
+			name: "invalid exclude_regex rejected",
+			configYAML: `
+dsn: "DATABASE=SAMPLE;HOSTNAME=db2host;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PWD=secret"
+schema: "DB2ADMIN"
+tables: ["EMPLOYEES"]
+table_exclude_regex: ["[bad"]
+`,
+			errContains: "table_exclude_regex",
+		},
+		{
+			name: "neither tables nor include_regex rejected",
+			configYAML: `
+dsn: "DATABASE=SAMPLE;HOSTNAME=db2host;PORT=50000;PROTOCOL=TCPIP;UID=db2inst1;PWD=secret"
+schema: "DB2ADMIN"
+`,
+			errContains: "either tables or table_include_regex must be specified",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			env := service.NewEnvironment()
+			conf, err := spec.ParseYAML(tc.configYAML, env)
+
+			var initErr error
+			if err == nil {
+				mgr := conf.Resources()
+				license.InjectTestService(mgr)
+				_, initErr = newDB2CDCInput(conf, mgr)
+			}
+
+			if tc.errContains == "" {
+				require.NoError(t, err, "config parse error")
+				require.NoError(t, initErr, "init error")
+			} else {
+				if err != nil {
+					require.Contains(t, err.Error(), tc.errContains)
+				} else {
+					require.Error(t, initErr)
+					require.Contains(t, initErr.Error(), tc.errContains)
+				}
+			}
+		})
+	}
 }

@@ -30,6 +30,9 @@ type StreamConfig struct {
 	// DB2 ≤ 11.x uses CHAR(10) FOR BIT DATA (10 bytes); DB2 12.1+ uses CHAR(16).
 	// Zero means auto-detect during Initialize (recommended).
 	CommitSeqByteLen int
+	// TableFilter narrows which tables to stream. When nil all tables in Tables
+	// (or all registered tables when Tables is empty) are streamed.
+	TableFilter func(string) bool
 	// afterIntentSeq is the last IBMSNAP_INTENTSEQ seen at StartingCSN.
 	// Used for composite (CSN, IntentSeq) pagination to resume mid-CSN.
 	afterIntentSeq int64
@@ -72,6 +75,8 @@ func NewStreamer(db *sql.DB, config StreamConfig, version Version) *Streamer {
 }
 
 // Initialize discovers the change tables for all monitored tables from IBMSNAP_REGISTER.
+// When config.Tables is empty, all registered tables for the schema are discovered dynamically.
+// config.TableFilter (if set) narrows the discovered or configured set.
 func (s *Streamer) Initialize(ctx context.Context) error {
 	cdcSchema := s.config.asncdcSchema()
 
@@ -89,6 +94,8 @@ func (s *Streamer) Initialize(ctx context.Context) error {
 	}
 	defer rows.Close()
 
+	dynamicDiscovery := len(s.config.Tables) == 0
+
 	registered := make(map[string]bool)
 
 	for rows.Next() {
@@ -100,12 +107,24 @@ func (s *Streamer) Initialize(ctx context.Context) error {
 		sourceTable = strings.TrimSpace(sourceTable)
 		cdTable = strings.TrimSpace(cdTable)
 
-		for _, monitoredTable := range s.config.Tables {
-			if strings.EqualFold(sourceTable, monitoredTable) {
-				changeTableName := fmt.Sprintf("%s.%s", strings.TrimSpace(cdOwner), cdTable)
-				s.changeTables[monitoredTable] = changeTableName
-				registered[monitoredTable] = true
-				break
+		if dynamicDiscovery {
+			// Accept all registered tables, apply filter below.
+			if s.config.TableFilter == nil || s.config.TableFilter(sourceTable) {
+				changeTableName := fmt.Sprintf("%s.%s", strings.TrimSpace(cdOwner), strings.TrimSpace(cdTable))
+				s.changeTables[sourceTable] = changeTableName
+				s.config.Tables = append(s.config.Tables, sourceTable)
+				registered[sourceTable] = true
+			}
+		} else {
+			for _, monitoredTable := range s.config.Tables {
+				if strings.EqualFold(sourceTable, monitoredTable) {
+					if s.config.TableFilter == nil || s.config.TableFilter(monitoredTable) {
+						changeTableName := fmt.Sprintf("%s.%s", strings.TrimSpace(cdOwner), strings.TrimSpace(cdTable))
+						s.changeTables[monitoredTable] = changeTableName
+					}
+					registered[monitoredTable] = true
+					break
+				}
 			}
 		}
 	}
@@ -114,10 +133,16 @@ func (s *Streamer) Initialize(ctx context.Context) error {
 		return fmt.Errorf("error iterating registration rows: %w", err)
 	}
 
-	for _, table := range s.config.Tables {
-		if !registered[table] {
-			return fmt.Errorf("table %s.%s is not registered for CDC (run ASNCDC.ADDTABLE)", s.config.Schema, table)
+	if !dynamicDiscovery {
+		for _, table := range s.config.Tables {
+			if !registered[table] {
+				return fmt.Errorf("table %s.%s is not registered for CDC (run ASNCDC.ADDTABLE)", s.config.Schema, table)
+			}
 		}
+	}
+
+	if len(s.changeTables) == 0 {
+		return fmt.Errorf("no CDC-registered tables found for schema %s (check ASNCDC.IBMSNAP_REGISTER)", s.config.Schema)
 	}
 
 	// Auto-detect IBMSNAP_COMMITSEQ byte length from the registered CD tables.

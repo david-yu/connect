@@ -22,6 +22,7 @@ import (
 
 	"github.com/redpanda-data/benthos/v4/public/service"
 
+	"github.com/redpanda-data/connect/v4/internal/confx"
 	"github.com/redpanda-data/connect/v4/internal/impl/db2/replication"
 	"github.com/redpanda-data/connect/v4/internal/license"
 )
@@ -30,6 +31,8 @@ const (
 	db2CDCFieldDSN                      = "dsn"
 	db2CDCFieldSchema                   = "schema"
 	db2CDCFieldTables                   = "tables"
+	db2CDCFieldTableIncludeRegex        = "table_include_regex"
+	db2CDCFieldTableExcludeRegex        = "table_exclude_regex"
 	db2CDCFieldCDCSchema                = "cdc_schema"
 	db2CDCFieldSnapshotMode             = "snapshot_mode"
 	db2CDCFieldSnapshotMaxBatchSize     = "snapshot_max_batch_size"
@@ -159,8 +162,25 @@ The connector tracks the highest processed `+"`IBMSNAP_COMMITSEQ`"+` so it can r
 			service.NewStringListField(db2CDCFieldTables).
 				Description("List of table names (without schema prefix) to capture changes from. "+
 					"Each table must already be registered with SQL Replication via ASNCDC.ADDTABLE before the connector starts. "+
-					"The connector will fail at startup if any listed table is missing from ASNCDC.IBMSNAP_REGISTER.").
-				Example([]string{"EMPLOYEES", "ORDERS"}),
+					"The connector will fail at startup if any listed table is missing from ASNCDC.IBMSNAP_REGISTER. "+
+					"When empty, all CDC-registered tables in the schema are discovered dynamically from ASNCDC.IBMSNAP_REGISTER.").
+				Example([]string{"EMPLOYEES", "ORDERS"}).
+				Optional(),
+
+			service.NewStringListField(db2CDCFieldTableIncludeRegex).
+				Description("Optional list of regular expressions; only tables whose names match at least one pattern are captured. "+
+					"Applied after `tables`. When `tables` is empty, all CDC-registered tables in the schema are discovered first and this filter narrows the set. "+
+					"Patterns are matched against the bare table name (without schema prefix).").
+				Example([]string{"^EMP", "^ORDER"}).
+				Optional().
+				Advanced(),
+
+			service.NewStringListField(db2CDCFieldTableExcludeRegex).
+				Description("Optional list of regular expressions; tables whose names match any pattern are excluded from capture. "+
+					"Applied after `table_include_regex`.").
+				Example([]string{"_TEST$", "_STAGING$"}).
+				Optional().
+				Advanced(),
 
 			service.NewStringField(db2CDCFieldCDCSchema).
 				Description("Schema that owns the SQL Replication control tables (IBMSNAP_REGISTER and the generated change tables). "+
@@ -262,6 +282,7 @@ type db2CDCInput struct {
 	dsn            string
 	schema         string
 	tables         []string
+	tableFilter    *confx.RegexpFilter
 	asnCDCSchema string
 	snapshotMode snapshotMode
 	checkpointMode string
@@ -307,18 +328,44 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 		return nil, fmt.Errorf("schema %q contains invalid characters: only uppercase letters, digits, and underscores are allowed", schema)
 	}
 
-	tables, err := conf.FieldStringList(db2CDCFieldTables)
-	if err != nil {
-		return nil, err
-	}
-	if len(tables) == 0 {
-		return nil, errors.New("at least one table must be specified")
+	var tables []string
+	if conf.Contains(db2CDCFieldTables) {
+		if tables, err = conf.FieldStringList(db2CDCFieldTables); err != nil {
+			return nil, err
+		}
 	}
 	for i, t := range tables {
 		tables[i] = strings.ToUpper(t)
 		if !isValidDB2Identifier(tables[i]) {
 			return nil, fmt.Errorf("tables[%d] %q contains invalid characters: only uppercase letters, digits, and underscores are allowed", i, t)
 		}
+	}
+
+	var includePatterns, excludePatterns []string
+	if conf.Contains(db2CDCFieldTableIncludeRegex) {
+		if includePatterns, err = conf.FieldStringList(db2CDCFieldTableIncludeRegex); err != nil {
+			return nil, err
+		}
+	}
+	if conf.Contains(db2CDCFieldTableExcludeRegex) {
+		if excludePatterns, err = conf.FieldStringList(db2CDCFieldTableExcludeRegex); err != nil {
+			return nil, err
+		}
+	}
+
+	tableIncludes, err := confx.ParseRegexpPatterns(includePatterns)
+	if err != nil {
+		return nil, fmt.Errorf("table_include_regex: %w", err)
+	}
+	tableExcludes, err := confx.ParseRegexpPatterns(excludePatterns)
+	if err != nil {
+		return nil, fmt.Errorf("table_exclude_regex: %w", err)
+	}
+
+	tableFilter := &confx.RegexpFilter{Include: tableIncludes, Exclude: tableExcludes}
+
+	if len(tables) == 0 && len(includePatterns) == 0 {
+		return nil, errors.New("either tables or table_include_regex must be specified")
 	}
 
 	asnCDCSchema, err := conf.FieldString(db2CDCFieldCDCSchema)
@@ -388,10 +435,13 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 		return nil, errors.New("poll_batch_size must be at least 1")
 	}
 
+	tableFilterFn := tableFilter.Matches
+
 	d := &db2CDCInput{
 		dsn:                dsn,
 		schema:             schema,
 		tables:             tables,
+		tableFilter:        tableFilter,
 		asnCDCSchema:   asnCDCSchema,
 		snapshotMode:   mode,
 		checkpointMode: checkpointMode,
@@ -405,6 +455,7 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 			AsnCDCSchema:   asnCDCSchema,
 			BatchSize:      snapshotMaxBatchSize,
 			IsolationLevel: "REPEATABLE READ",
+			TableFilter:    tableFilterFn,
 		},
 		streamConfig: replication.StreamConfig{
 			Schema:          schema,
@@ -413,6 +464,7 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 			BackoffInterval: streamBackoffInterval,
 			PollBatchSize:   pollBatchSize,
 			StartingCSN:     replication.NullCSN(),
+			TableFilter:     tableFilterFn,
 		},
 		capped:    checkpoint.NewCapped[replication.CSN](int64(checkpointLimit)),
 		eventChan: make(chan replication.ChangeEvent, db2CDCEventChanBuf),
