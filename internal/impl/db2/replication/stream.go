@@ -33,9 +33,6 @@ type StreamConfig struct {
 	// TableFilter narrows which tables to stream. When nil all tables in Tables
 	// (or all registered tables when Tables is empty) are streamed.
 	TableFilter func(string) bool
-	// afterIntentSeq is the last IBMSNAP_INTENTSEQ seen at StartingCSN.
-	// Used for composite (CSN, IntentSeq) pagination to resume mid-CSN.
-	afterIntentSeq int64
 }
 
 // asncdcSchema returns the CDC control schema, defaulting to "ASNCDC".
@@ -62,15 +59,22 @@ type Streamer struct {
 	config       StreamConfig
 	version      Version
 	changeTables map[string]string // monitored table name -> change table qualified name
+
+	// pendingBeforeByTable holds the trailing opTypeUpdateBefore event (opcode 3)
+	// when a PollBatchSize boundary falls between the D and I rows of an update
+	// pair. The matching opTypeUpdateAfter row will arrive in the next poll and
+	// will be prepended before pairOpcodeEvents merges the pair.
+	pendingBeforeByTable map[string]*ChangeEvent
 }
 
 // NewStreamer creates a new Streamer.
 func NewStreamer(db *sql.DB, config StreamConfig, version Version) *Streamer {
 	return &Streamer{
-		db:           db,
-		config:       config,
-		version:      version,
-		changeTables: make(map[string]string),
+		db:                   db,
+		config:               config,
+		version:              version,
+		changeTables:         make(map[string]string),
+		pendingBeforeByTable: make(map[string]*ChangeEvent),
 	}
 }
 
@@ -112,7 +116,9 @@ func (s *Streamer) Initialize(ctx context.Context) error {
 			if s.config.TableFilter == nil || s.config.TableFilter(sourceTable) {
 				changeTableName := fmt.Sprintf("%s.%s", strings.TrimSpace(cdOwner), strings.TrimSpace(cdTable))
 				s.changeTables[sourceTable] = changeTableName
-				s.config.Tables = append(s.config.Tables, sourceTable)
+				// Force a new backing array to avoid aliasing the caller's slice
+				// (on reconnect, the same StreamConfig is reused with spare capacity).
+				s.config.Tables = append(s.config.Tables[:len(s.config.Tables):len(s.config.Tables)], sourceTable)
 				registered[sourceTable] = true
 			}
 		} else {
@@ -181,7 +187,10 @@ func (s *Streamer) detectCommitSeqByteLen(ctx context.Context) (int, error) {
 // Stream continuously polls change tables and sends events to handler until ctx is cancelled.
 func (s *Streamer) Stream(ctx context.Context, handler func(event ChangeEvent) error) error {
 	currentCSN := s.config.StartingCSN
-	afterIntentSeq := s.config.afterIntentSeq
+	// intentSeqByTable tracks the last IBMSNAP_INTENTSEQ seen per table at currentCSN,
+	// enabling composite (CSN, IntentSeq) pagination when a batch boundary lands
+	// mid-transaction at the same CSN across multiple tables.
+	intentSeqByTable := make(map[string]int64)
 
 	for {
 		select {
@@ -190,7 +199,7 @@ func (s *Streamer) Stream(ctx context.Context, handler func(event ChangeEvent) e
 		default:
 		}
 
-		events, maxCSN, maxIntent, err := s.pollChanges(ctx, currentCSN, afterIntentSeq)
+		events, maxCSN, newIntentSeqs, err := s.pollChanges(ctx, currentCSN, intentSeqByTable)
 		if err != nil {
 			return fmt.Errorf("polling changes: %w", err)
 		}
@@ -203,7 +212,7 @@ func (s *Streamer) Stream(ctx context.Context, handler func(event ChangeEvent) e
 
 		if len(events) > 0 {
 			currentCSN = maxCSN
-			afterIntentSeq = maxIntent
+			intentSeqByTable = newIntentSeqs
 		} else {
 			select {
 			case <-ctx.Done():
@@ -216,28 +225,37 @@ func (s *Streamer) Stream(ctx context.Context, handler func(event ChangeEvent) e
 
 // tableResult holds one table's poll output.
 type tableResult struct {
-	events []ChangeEvent
-	full   bool // true when len(events) == PollBatchSize
+	tableName string
+	events    []ChangeEvent
+	// full is true when the raw SQL row count equalled PollBatchSize (before
+	// pairOpcodeEvents merging) OR when the table has a pending before-image
+	// that must be matched next poll. Either condition means the watermark must
+	// not advance past this table's last event CSN.
+	full bool
 }
 
 // computeSafeCSN returns the highest CSN that is safe to advance to across all
 // tables in a single poll round.
 //
-// For each full table (exactly PollBatchSize rows), the batch may have been
-// truncated mid-transaction. The safe per-table ceiling is the penultimate
-// distinct CSN within that table's own batch; events at the max CSN must be
-// re-fetched. Edge case: all rows in the batch share one CSN — advance to
-// tableMax anyway (at-least-once; caller deduplicates on csn+intentSeq).
+// For each full table (raw row count == PollBatchSize, or pending before-image
+// held), the batch may have been truncated mid-transaction. The safe per-table
+// ceiling is the penultimate distinct CSN within that table's own batch; events
+// at the max CSN must be re-fetched. Edge case: all rows in the batch share one
+// CSN — advance to tableMax anyway (at-least-once; caller deduplicates on
+// csn+intentSeq).
 //
 // Non-full tables impose no constraint: all rows up to upperCSN were returned.
 //
 // The global safe ceiling is the minimum of all per-table ceilings, starting
 // from upperCSN (no full table → no narrowing).
-func computeSafeCSN(results []tableResult, upperCSN CSN, batchSize int) CSN {
+func computeSafeCSN(results []tableResult, upperCSN CSN) CSN {
 	safeCSN := upperCSN
 	for _, r := range results {
-		if len(r.events) != batchSize {
+		if !r.full {
 			continue // not full — no constraint from this table
+		}
+		if len(r.events) == 0 {
+			continue // pending-only full: no events to bound against
 		}
 		tableMax := r.events[len(r.events)-1].CSN
 		// Default: edge case where all rows share one CSN — advance to tableMax.
@@ -283,40 +301,53 @@ func computeReturnCSN(safeCSN CSN, sorted []ChangeEvent) CSN {
 // Using the global penultimate would cause events from a full table at a lower
 // CSN to be permanently skipped when another table has events at a higher CSN.
 //
-// afterIntentSeq enables composite (CSN, IntentSeq) pagination so that a
-// PollBatchSize cutoff mid-transaction does not lose the remaining rows at
-// the same CSN on the next poll.
-func (s *Streamer) pollChanges(ctx context.Context, afterCSN CSN, afterIntentSeq int64) ([]ChangeEvent, CSN, int64, error) {
+// intentSeqByTable holds the per-table last IBMSNAP_INTENTSEQ seen at afterCSN.
+// When any table has a non-zero entry, composite (CSN, IntentSeq) pagination is
+// used for that table so the batch does not re-deliver already-seen rows.
+// A global afterIntentSeq would incorrectly skip table B's events when table A
+// defines the high-water mark for a shared CSN.
+func (s *Streamer) pollChanges(ctx context.Context, afterCSN CSN, intentSeqByTable map[string]int64) ([]ChangeEvent, CSN, map[string]int64, error) {
 	upperCSN, err := s.getUpperBound(ctx)
 	if err != nil {
-		return nil, CSN{}, 0, fmt.Errorf("getting upper bound: %w", err)
+		return nil, CSN{}, nil, fmt.Errorf("getting upper bound: %w", err)
 	}
 	// Skip the poll when the capture daemon hasn't advanced past our watermark,
-	// but only when afterIntentSeq is zero (no pending rows at the current CSN).
-	// If afterIntentSeq > 0 we are mid-transaction and must continue polling to
-	// drain the remaining rows at exactly afterCSN even though upperCSN == afterCSN.
-	if !upperCSN.Greater(afterCSN) && afterIntentSeq == 0 {
-		return nil, afterCSN, afterIntentSeq, nil
+	// but only when no table has mid-CSN pending rows (intentSeq > 0).
+	// Any table with intentSeq > 0 means we are mid-transaction and must continue.
+	anyPending := false
+	for _, seq := range intentSeqByTable {
+		if seq > 0 {
+			anyPending = true
+			break
+		}
+	}
+	if !upperCSN.Greater(afterCSN) && !anyPending {
+		return nil, afterCSN, intentSeqByTable, nil
 	}
 
 	results := make([]tableResult, 0, len(s.changeTables))
 	allEvents := make([]ChangeEvent, 0, len(s.changeTables)*s.config.PollBatchSize)
 
 	for tableName, changeTableName := range s.changeTables {
-		events, err := s.pollChangeTable(ctx, tableName, changeTableName, afterCSN, afterIntentSeq, upperCSN)
+		tableIntentSeq := intentSeqByTable[tableName]
+		events, rawCount, err := s.pollChangeTable(ctx, tableName, changeTableName, afterCSN, tableIntentSeq, upperCSN)
 		if err != nil {
-			return nil, CSN{}, 0, fmt.Errorf("polling change table %s: %w", changeTableName, err)
+			return nil, CSN{}, nil, fmt.Errorf("polling change table %s: %w", changeTableName, err)
 		}
-		results = append(results, tableResult{events: events, full: len(events) == s.config.PollBatchSize})
+		// full=true when: raw row count hit the batch limit (batch was truncated),
+		// OR a pending before-image is held for this table (matching I row must
+		// arrive next poll — watermark must not advance past the pending CSN).
+		full := rawCount == s.config.PollBatchSize || s.pendingBeforeByTable[tableName] != nil
+		results = append(results, tableResult{tableName: tableName, events: events, full: full})
 		allEvents = append(allEvents, events...)
 	}
 
 	sorted := s.sortEventsByCSN(allEvents)
 	if len(sorted) == 0 {
-		return nil, afterCSN, afterIntentSeq, nil
+		return nil, afterCSN, intentSeqByTable, nil
 	}
 
-	safeCSN := computeSafeCSN(results, upperCSN, s.config.PollBatchSize)
+	safeCSN := computeSafeCSN(results, upperCSN)
 
 	// Trim events above the safe ceiling when any table was full and narrowed it.
 	if sorted[len(sorted)-1].CSN.Greater(safeCSN) {
@@ -331,22 +362,29 @@ func (s *Streamer) pollChanges(ctx context.Context, afterCSN CSN, afterIntentSeq
 	}
 
 	if len(sorted) == 0 {
-		return nil, afterCSN, afterIntentSeq, nil
+		return nil, afterCSN, intentSeqByTable, nil
 	}
 
 	returnCSN := computeReturnCSN(safeCSN, sorted)
-	var returnIntentSeq int64
-	// Track the max intentSeq at the return CSN for composite pagination.
-	for i := len(sorted) - 1; i >= 0; i-- {
-		if sorted[i].CSN.Equal(returnCSN) {
-			if sorted[i].IntentSeq > returnIntentSeq {
-				returnIntentSeq = sorted[i].IntentSeq
+
+	// Build per-table max intentSeq at returnCSN for composite pagination.
+	// If returnCSN advanced past afterCSN, return an empty map (intent seqs reset).
+	var newIntentSeqs map[string]int64
+	if returnCSN.Greater(afterCSN) {
+		newIntentSeqs = make(map[string]int64) // CSN advanced: all intent seqs reset
+	} else {
+		newIntentSeqs = make(map[string]int64, len(intentSeqByTable))
+		for i := len(sorted) - 1; i >= 0; i-- {
+			ev := sorted[i]
+			if !ev.CSN.Equal(returnCSN) {
+				break
 			}
-		} else {
-			break
+			if ev.IntentSeq > newIntentSeqs[ev.Table] {
+				newIntentSeqs[ev.Table] = ev.IntentSeq
+			}
 		}
 	}
-	return sorted, returnCSN, returnIntentSeq, nil
+	return sorted, returnCSN, newIntentSeqs, nil
 }
 
 // getUpperBound returns the highest log position the DB2 capture daemon has
@@ -379,6 +417,9 @@ func (s *Streamer) getUpperBound(ctx context.Context) (CSN, error) {
 	}
 
 	if len(synchpointBytes) == 0 {
+		// Note: if SYNCHPOINT is null (capture daemon not yet written), returns NullCSN.
+		// buildPollQuery with NullCSN upper bound emits X'00...' which safely returns 0 rows.
+		// This is correct-by-accident; a future hardening pass should add an explicit nil check.
 		return NullCSN(), nil
 	}
 
@@ -443,23 +484,31 @@ func (s *Streamer) buildPollQuery(changeTableName string, afterCSN CSN, afterInt
 }
 
 // pollChangeTable queries a single change table for events in the CSN window (afterCSN, upperCSN].
-func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableName string, afterCSN CSN, afterIntentSeq int64, upperCSN CSN) ([]ChangeEvent, error) {
+//
+// Returns the merged events, the raw SQL row count (before pairOpcodeEvents merging), and any error.
+// The raw row count is used by the caller to determine whether the batch was full (truncated).
+//
+// Pending before-image handling: when the LEAD/LAG query places a D+I pair at the PollBatchSize
+// boundary, the opTypeUpdateBefore (D) row is saved in s.pendingBeforeByTable[tableName] instead
+// of being emitted as a phantom delete. On the next poll, it is prepended to the raw events before
+// pairOpcodeEvents processes the complete pair.
+func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableName string, afterCSN CSN, afterIntentSeq int64, upperCSN CSN) ([]ChangeEvent, int, error) {
 	query := s.buildPollQuery(changeTableName, afterCSN, afterIntentSeq, upperCSN)
 
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("querying change table %s: %w", changeTableName, err)
+		return nil, 0, fmt.Errorf("querying change table %s: %w", changeTableName, err)
 	}
 	defer rows.Close()
 
 	columns, err := rows.Columns()
 	if err != nil {
-		return nil, fmt.Errorf("getting columns for %s: %w", changeTableName, err)
+		return nil, 0, fmt.Errorf("getting columns for %s: %w", changeTableName, err)
 	}
 
 	columnTypes, err := rows.ColumnTypes()
 	if err != nil {
-		return nil, fmt.Errorf("getting column types for %s: %w", changeTableName, err)
+		return nil, 0, fmt.Errorf("getting column types for %s: %w", changeTableName, err)
 	}
 
 	// Locate metadata columns by name; collect data column indices.
@@ -488,27 +537,36 @@ func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableNa
 	}
 
 	if opIdx < 0 || csnIdx < 0 || intentSeqIdx < 0 {
-		return nil, fmt.Errorf("change table %s is missing required IBMSNAP_ columns (found: %v)", changeTableName, columns)
+		return nil, 0, fmt.Errorf("change table %s is missing required IBMSNAP_ columns (found: %v)", changeTableName, columns)
 	}
 
-	var events []ChangeEvent
+	var rawEvents []ChangeEvent
+	var rawCount int
+
+	// Reuse scanDest and scanPtrs across rows to avoid one allocation per column per row.
+	scanDest := make([]any, len(columns))
+	scanPtrs := make([]any, len(columns))
+	for i := range scanDest {
+		scanPtrs[i] = &scanDest[i]
+	}
 
 	for rows.Next() {
-		scanDest := make([]any, len(columns))
+		rawCount++
+		// Clear previous row values before scanning (avoids stale data on nil columns).
 		for i := range scanDest {
-			scanDest[i] = new(any)
+			scanDest[i] = nil
 		}
 
-		if err := rows.Scan(scanDest...); err != nil {
-			return nil, fmt.Errorf("scanning row from %s: %w", changeTableName, err)
+		if err := rows.Scan(scanPtrs...); err != nil {
+			return nil, 0, fmt.Errorf("scanning row from %s: %w", changeTableName, err)
 		}
 
-		csnBytes := getBytes(scanDest[csnIdx])
-		intentSeq := getInt64(scanDest[intentSeqIdx])
+		csnBytes := getBytes(&scanDest[csnIdx])
+		intentSeq := getInt64(&scanDest[intentSeqIdx])
 
 		var timestamp time.Time
 		if tsIdx >= 0 {
-			timestamp = getTime(scanDest[tsIdx])
+			timestamp = getTime(&scanDest[tsIdx])
 		}
 
 		csn := NewCSNFromDBValue(csnBytes)
@@ -516,10 +574,10 @@ func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableNa
 		var opType OpType
 		var opErr error
 		if opcodeIdx >= 0 {
-			code := getInt64(scanDest[opcodeIdx])
+			code := getInt64(&scanDest[opcodeIdx])
 			opType, opErr = fromOpcodeInt(code)
 		} else {
-			operation := getString(scanDest[opIdx])
+			operation := getString(&scanDest[opIdx])
 			opType, opErr = FromDB2Op(operation)
 		}
 		if opErr != nil {
@@ -529,11 +587,10 @@ func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableNa
 
 		data := make(map[string]any, len(dataColNames))
 		for i, idx := range dataColIdxs {
-			value := *(scanDest[idx].(*any))
-			data[dataColNames[i]] = convertDB2Value(value, columnTypes[idx])
+			data[dataColNames[i]] = convertDB2Value(scanDest[idx], columnTypes[idx])
 		}
 
-		events = append(events, ChangeEvent{
+		rawEvents = append(rawEvents, ChangeEvent{
 			Schema:    s.config.Schema,
 			Table:     tableName,
 			Operation: opType,
@@ -544,14 +601,44 @@ func (s *Streamer) pollChangeTable(ctx context.Context, tableName, changeTableNa
 		})
 	}
 
-	events = pairOpcodeEvents(events)
-	return events, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, rawCount, err
+	}
+
+	// Cross-poll D+I pairing: inject any pending before-image from the previous
+	// poll at the front of rawEvents when it matches the first after-image.
+	if pending := s.pendingBeforeByTable[tableName]; pending != nil {
+		if len(rawEvents) > 0 &&
+			rawEvents[0].Operation == opTypeUpdateAfter &&
+			rawEvents[0].CSN.Equal(pending.CSN) {
+			rawEvents = append([]ChangeEvent{*pending}, rawEvents...)
+		}
+		// Whether matched or not, clear the pending state now — it either
+		// contributed to a pair or the matching I never arrived (shouldn't
+		// happen with DB2 SQL Replication, but we must not hold stale state).
+		delete(s.pendingBeforeByTable, tableName)
+	}
+
+	// If the last raw event is an unmatched opTypeUpdateBefore, hold it for
+	// the next poll. pairOpcodeEvents will see a complete pair next time.
+	if len(rawEvents) > 0 && rawEvents[len(rawEvents)-1].Operation == opTypeUpdateBefore {
+		pending := rawEvents[len(rawEvents)-1]
+		s.pendingBeforeByTable[tableName] = &pending
+		rawEvents = rawEvents[:len(rawEvents)-1]
+	}
+
+	return pairOpcodeEvents(rawEvents), rawCount, nil
 }
 
 // pairOpcodeEvents merges consecutive opTypeUpdateBefore + opTypeUpdateAfter pairs
 // (produced by the LEAD/LAG query) into a single OpTypeUpdate event with BeforeData
 // populated. Pairs must be consecutive and share the same CSN (guaranteed by the
 // LEAD/LAG window function and computeSafeCSN pagination).
+//
+// Cross-batch D+I pairs are handled upstream: pollChangeTable injects the
+// pending before-image at the front and strips the trailing before-image before
+// calling this function, so pairOpcodeEvents only sees complete pairs or
+// non-update events.
 func pairOpcodeEvents(events []ChangeEvent) []ChangeEvent {
 	if len(events) == 0 {
 		return events
@@ -575,13 +662,6 @@ func pairOpcodeEvents(events []ChangeEvent) []ChangeEvent {
 				i++ // skip the after-image row
 				continue
 			}
-		}
-		// Emit orphaned update-before/after as delete/insert (safety fallback).
-		switch ev.Operation {
-		case opTypeUpdateBefore:
-			ev.Operation = OpTypeDelete
-		case opTypeUpdateAfter:
-			ev.Operation = OpTypeInsert
 		}
 		out = append(out, ev)
 	}
@@ -666,6 +746,10 @@ func getBytes(dest any) []byte {
 }
 
 // getInt64 extracts an int64 from a scanned any pointer.
+// Note (MI-8): returns 0 for unknown types. IntentSeq=0 is a valid DB2 value;
+// if IBMSNAP_INTENTSEQ contains an unexpected type (e.g. float64 from a mock
+// driver), the 0 return can satisfy intentSeq > 0 guards and trigger infinite
+// pagination. Full fix (type assertions + error return) is out of scope.
 func getInt64(dest any) int64 {
 	value := *(dest.(*any))
 	if value == nil {

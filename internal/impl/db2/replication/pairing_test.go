@@ -91,14 +91,18 @@ func TestPairOpcodeEvents(t *testing.T) {
 			},
 		},
 		{
-			name: "orphaned_update_before_fallback_to_delete",
+			// Cross-batch D+I pairs are handled upstream: pollChangeTable strips the trailing
+			// opTypeUpdateBefore into pendingBeforeByTable. pairOpcodeEvents only sees complete
+			// pairs. If an unmatched pair arrives here (different CSNs, shouldn't happen in
+			// production), events pass through with their raw internal operation types.
+			name: "mismatched_csn_pair_passthrough",
 			input: []ChangeEvent{
 				{CSN: csn100, IntentSeq: 1, Operation: opTypeUpdateBefore, Data: map[string]any{"ID": 1}},
 				{CSN: csn101, IntentSeq: 2, Operation: opTypeUpdateAfter, Data: map[string]any{"ID": 1}},
 			},
 			expect: []ChangeEvent{
-				{CSN: csn100, IntentSeq: 1, Operation: OpTypeDelete, Data: map[string]any{"ID": 1}},
-				{CSN: csn101, IntentSeq: 2, Operation: OpTypeInsert, Data: map[string]any{"ID": 1}},
+				{CSN: csn100, IntentSeq: 1, Operation: opTypeUpdateBefore, Data: map[string]any{"ID": 1}},
+				{CSN: csn101, IntentSeq: 2, Operation: opTypeUpdateAfter, Data: map[string]any{"ID": 1}},
 			},
 		},
 		{

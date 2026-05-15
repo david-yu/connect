@@ -58,7 +58,7 @@ func TestPollChangesBatchTruncationSafety(t *testing.T) {
 	}, Version{})
 	s.changeTables["T"] = "ASNCDC.T_CT"
 
-	events, maxCSN, _, err := s.pollChanges(context.Background(), NewCSN(0), 0)
+	events, maxCSN, _, err := s.pollChanges(context.Background(), NewCSN(0), nil)
 
 	require.NoError(t, err)
 	// Only the first event (CSN=10) is delivered; CSN=20 is trimmed for re-fetch.
@@ -106,7 +106,7 @@ func TestPollChangesBatchTruncationRetrimMultipleRows(t *testing.T) {
 	}, Version{})
 	s.changeTables["T"] = "ASNCDC.T_CT"
 
-	events, maxCSN, _, err := s.pollChanges(context.Background(), NewCSN(0), 0)
+	events, maxCSN, _, err := s.pollChanges(context.Background(), NewCSN(0), nil)
 
 	require.NoError(t, err)
 	// Both CSN=20 rows (the D+I pair) are trimmed together so the pair is never split.
@@ -154,7 +154,7 @@ func TestPollChangesBatchTruncationAllSameCSN(t *testing.T) {
 	}, Version{})
 	s.changeTables["T"] = "ASNCDC.T_CT"
 
-	events, maxCSN, _, err := s.pollChanges(context.Background(), NewCSN(0), 0)
+	events, maxCSN, _, err := s.pollChanges(context.Background(), NewCSN(0), nil)
 
 	require.NoError(t, err)
 	// All 3 events must be returned so the connector can make progress.
@@ -196,7 +196,7 @@ func TestPollChangesNoBatchTruncationWhenUnderLimit(t *testing.T) {
 	}, Version{})
 	s.changeTables["T"] = "ASNCDC.T_CT"
 
-	events, maxCSN, _, err := s.pollChanges(context.Background(), NewCSN(0), 0)
+	events, maxCSN, _, err := s.pollChanges(context.Background(), NewCSN(0), nil)
 
 	require.NoError(t, err)
 	require.Len(t, events, 2, "under-limit batch must not be truncated")

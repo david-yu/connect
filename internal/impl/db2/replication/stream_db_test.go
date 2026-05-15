@@ -324,7 +324,7 @@ func TestPollChangeTable(t *testing.T) {
 				PollBatchSize: 100,
 			}, Version{})
 
-			events, err := s.pollChangeTable(context.Background(), "EMPLOYEES", "ASNCDC.EMPLOYEES_CT",
+			events, _, err := s.pollChangeTable(context.Background(), "EMPLOYEES", "ASNCDC.EMPLOYEES_CT",
 				NewCSN(0), 0, NewCSN(99999))
 
 			if tc.wantErr {
@@ -411,7 +411,7 @@ func TestPollChanges(t *testing.T) {
 				s.changeTables["EMPLOYEES"] = "ASNCDC.EMPLOYEES_CT"
 			}
 
-			events, maxCSN, _, err := s.pollChanges(context.Background(), tc.afterCSN, 0)
+			events, maxCSN, _, err := s.pollChanges(context.Background(), tc.afterCSN, nil)
 			if tc.wantErr {
 				require.Error(t, err)
 				return
@@ -485,7 +485,7 @@ func TestPollChangeTableDeleteEvent(t *testing.T) {
 	})
 
 	s := NewStreamer(db, StreamConfig{Schema: "MYSCHEMA", PollBatchSize: 100}, Version{})
-	events, err := s.pollChangeTable(context.Background(), "EMPLOYEES", "ASNCDC.EMPLOYEES_CT",
+	events, _, err := s.pollChangeTable(context.Background(), "EMPLOYEES", "ASNCDC.EMPLOYEES_CT",
 		NewCSN(0), 0, NewCSN(99999))
 
 	require.NoError(t, err)
@@ -535,7 +535,7 @@ func TestPollChangeTableUpdateAsDIPair(t *testing.T) {
 	})
 
 	s := NewStreamer(db, StreamConfig{Schema: "MYSCHEMA", PollBatchSize: 100}, Version{})
-	events, err := s.pollChangeTable(context.Background(), "EMPLOYEES", "ASNCDC.EMPLOYEES_CT",
+	events, _, err := s.pollChangeTable(context.Background(), "EMPLOYEES", "ASNCDC.EMPLOYEES_CT",
 		NewCSN(0), 0, NewCSN(99999))
 
 	require.NoError(t, err)
@@ -600,7 +600,7 @@ func TestPollChangesMultiTableCSNOrdering(t *testing.T) {
 	s.changeTables["ORDERS"] = "ASNCDC.ORDERS_CT"
 	s.changeTables["EMPLOYEES"] = "ASNCDC.EMPLOYEES_CT"
 
-	events, maxCSN, _, err := s.pollChanges(context.Background(), NewCSN(0), 0)
+	events, maxCSN, _, err := s.pollChanges(context.Background(), NewCSN(0), nil)
 
 	require.NoError(t, err)
 	require.Len(t, events, 3)
@@ -760,4 +760,124 @@ func TestStreamHandlerError(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "handler refused event")
+}
+
+// TestPollChangeTableFullBatchWithPairedUpdates verifies that tableResult.full is
+// set from the raw SQL row count BEFORE pairOpcodeEvents merging (C1 fix).
+//
+// Scenario: PollBatchSize=4, feed exactly 4 rows as 2 D+I pairs (opcodes 3+4).
+// pairOpcodeEvents reduces them to 2 OpTypeUpdate events.  tableResult.full must
+// still be true because the raw row count was 4 == PollBatchSize, even though
+// len(events) == 2 after merging.  Without C1, len(events)==2 != batchSize==4
+// → full=false → computeSafeCSN would not protect the watermark.
+func TestPollChangeTableFullBatchWithPairedUpdates(t *testing.T) {
+	t.Parallel()
+
+	sharedCSN := []byte{0, 0, 0, 0, 0, 0, 0, 42}
+	ts := time.Now().Truncate(time.Second)
+
+	// 4 rows: 2 D+I pairs using IBMSNAP_OPCODE (3=update-before, 4=update-after).
+	db := openFakeDB(t, &replFakeHandlers{
+		query: func(q string, _ []driver.Value) ([]string, [][]driver.Value, error) {
+			if strings.Contains(q, "SYNCHPOINT") {
+				return []string{"MAX(SYNCHPOINT)"}, [][]driver.Value{
+					{[]byte{0, 0, 0, 0, 0, 0, 0, 99}},
+				}, nil
+			}
+			return []string{
+				"IBMSNAP_OPCODE",
+				"IBMSNAP_COMMITSEQ", "IBMSNAP_INTENTSEQ", "IBMSNAP_OPERATION", "IBMSNAP_LOGMARKER",
+				"ID", "VAL",
+			}, [][]driver.Value{
+				{int64(3), sharedCSN, int64(1), "D", ts, int64(1), int64(100)}, // pair 1 before
+				{int64(4), sharedCSN, int64(2), "I", ts, int64(1), int64(101)}, // pair 1 after
+				{int64(3), sharedCSN, int64(3), "D", ts, int64(2), int64(200)}, // pair 2 before
+				{int64(4), sharedCSN, int64(4), "I", ts, int64(2), int64(201)}, // pair 2 after
+			}, nil
+		},
+	})
+
+	s := NewStreamer(db, StreamConfig{Schema: "MYSCHEMA", PollBatchSize: 4}, Version{})
+	s.changeTables["T"] = "ASNCDC.T_CT"
+
+	events, rawCount, err := s.pollChangeTable(context.Background(), "T", "ASNCDC.T_CT",
+		NewCSN(0), 0, NewCSN(99))
+	require.NoError(t, err)
+	require.Len(t, events, 2, "two D+I pairs must merge to 2 update events")
+	assert.Equal(t, 4, rawCount, "raw row count must be 4 even though only 2 events after merging")
+	assert.Equal(t, OpTypeUpdate, events[0].Operation)
+	assert.Equal(t, OpTypeUpdate, events[1].Operation)
+
+	// Verify via pollChanges that full=true is propagated correctly.
+	events2, _, _, err := s.pollChanges(context.Background(), NewCSN(0), nil)
+	require.NoError(t, err)
+	require.Len(t, events2, 2, "pollChanges must return 2 merged update events")
+}
+
+// TestPollChangeTableCrossBatchUpdatePairing verifies cross-poll D+I pair merging (C3 fix).
+//
+// When PollBatchSize=1 and a D+I pair straddles two polls:
+//   - Poll 1 returns only the D row (opcode 3). It must NOT be emitted as a delete.
+//     The pending before-image is held in pendingBeforeByTable.
+//   - Poll 2 returns only the I row (opcode 4). It must be merged with the pending
+//     before-image into a single OpTypeUpdate event with BeforeData populated.
+func TestPollChangeTableCrossBatchUpdatePairing(t *testing.T) {
+	t.Parallel()
+
+	sharedCSN := []byte{0, 0, 0, 0, 0, 0, 0, 55}
+	ts := time.Now().Truncate(time.Second)
+
+	callNum := 0
+	db := openFakeDB(t, &replFakeHandlers{
+		query: func(q string, _ []driver.Value) ([]string, [][]driver.Value, error) {
+			if strings.Contains(q, "SYNCHPOINT") {
+				return []string{"MAX(SYNCHPOINT)"}, [][]driver.Value{
+					{[]byte{0, 0, 0, 0, 0, 0, 0, 99}},
+				}, nil
+			}
+			callNum++
+			cols := []string{
+				"IBMSNAP_OPCODE",
+				"IBMSNAP_COMMITSEQ", "IBMSNAP_INTENTSEQ", "IBMSNAP_OPERATION", "IBMSNAP_LOGMARKER",
+				"ID", "VAL",
+			}
+			switch callNum {
+			case 1:
+				// Batch 1: only the before-image (opcode 3)
+				return cols, [][]driver.Value{
+					{int64(3), sharedCSN, int64(1), "D", ts, int64(7), int64(10)},
+				}, nil
+			case 2:
+				// Batch 2: only the after-image (opcode 4)
+				return cols, [][]driver.Value{
+					{int64(4), sharedCSN, int64(2), "I", ts, int64(7), int64(20)},
+				}, nil
+			default:
+				return cols, nil, nil
+			}
+		},
+	})
+
+	s := NewStreamer(db, StreamConfig{Schema: "MYSCHEMA", PollBatchSize: 1}, Version{})
+
+	// Poll 1: D row (opcode 3) arrives. Must be held as pending — 0 events emitted.
+	events1, rawCount1, err := s.pollChangeTable(context.Background(), "T", "ASNCDC.T_CT",
+		NewCSN(0), 0, NewCSN(99))
+	require.NoError(t, err)
+	assert.Empty(t, events1, "D row (opcode 3) must be held as pending, not emitted")
+	assert.Equal(t, 1, rawCount1, "raw count must be 1")
+	assert.NotNil(t, s.pendingBeforeByTable["T"], "pending before-image must be held")
+
+	// Poll 2: I row (opcode 4) arrives. Must be merged with pending into 1 update event.
+	events2, rawCount2, err := s.pollChangeTable(context.Background(), "T", "ASNCDC.T_CT",
+		NewCSN(0), 0, NewCSN(99))
+	require.NoError(t, err)
+	require.Len(t, events2, 1, "pending before-image + I row must merge to 1 update event")
+	assert.Equal(t, 1, rawCount2, "raw count must be 1 (only the I row)")
+	assert.Nil(t, s.pendingBeforeByTable["T"], "pending state must be cleared after merge")
+
+	update := events2[0]
+	assert.Equal(t, OpTypeUpdate, update.Operation)
+	assert.Equal(t, int64(20), update.Data["VAL"], "after-image value must be in Data")
+	assert.Equal(t, int64(10), update.BeforeData["VAL"], "before-image value must be in BeforeData")
 }

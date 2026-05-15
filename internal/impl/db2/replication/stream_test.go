@@ -130,7 +130,7 @@ func TestComputeSafeCSN(t *testing.T) {
 			{events: []ChangeEvent{{CSN: NewCSN(50)}, {CSN: NewCSN(50)}}, full: true},
 			{events: []ChangeEvent{{CSN: NewCSN(80)}}, full: false},
 		}
-		safe := computeSafeCSN(results, upper, 2)
+		safe := computeSafeCSN(results, upper)
 		assert.Equal(t, uint64(50), safe.Uint64())
 	})
 
@@ -142,7 +142,7 @@ func TestComputeSafeCSN(t *testing.T) {
 			{events: []ChangeEvent{{CSN: NewCSN(40)}, {CSN: NewCSN(50)}}, full: true},
 			{events: []ChangeEvent{{CSN: NewCSN(80)}}, full: false},
 		}
-		safe := computeSafeCSN(results, upper, 2)
+		safe := computeSafeCSN(results, upper)
 		assert.Equal(t, uint64(40), safe.Uint64())
 	})
 
@@ -152,7 +152,7 @@ func TestComputeSafeCSN(t *testing.T) {
 			{events: []ChangeEvent{{CSN: NewCSN(50)}}, full: false},
 			{events: []ChangeEvent{{CSN: NewCSN(80)}}, full: false},
 		}
-		safe := computeSafeCSN(results, upper, 2)
+		safe := computeSafeCSN(results, upper)
 		assert.Equal(t, upper.Uint64(), safe.Uint64())
 	})
 
@@ -164,7 +164,7 @@ func TestComputeSafeCSN(t *testing.T) {
 			{events: []ChangeEvent{{CSN: NewCSN(30)}, {CSN: NewCSN(40)}}, full: true},
 			{events: []ChangeEvent{{CSN: NewCSN(70)}, {CSN: NewCSN(90)}}, full: true},
 		}
-		safe := computeSafeCSN(results, upper, 2)
+		safe := computeSafeCSN(results, upper)
 		assert.Equal(t, uint64(30), safe.Uint64())
 	})
 }

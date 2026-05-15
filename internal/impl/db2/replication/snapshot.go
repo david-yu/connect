@@ -309,20 +309,26 @@ func (s *Snapshotter) fetchBatch(ctx context.Context, tx *sql.Tx, tableName stri
 
 	var result []map[string]any
 
+	// Reuse scanDest and scanPtrs across rows to avoid one allocation per column per row.
+	scanDest := make([]any, len(columns))
+	scanPtrs := make([]any, len(columns))
+	for i := range scanDest {
+		scanPtrs[i] = &scanDest[i]
+	}
+
 	for rows.Next() {
-		scanDest := make([]any, len(columns))
+		// Clear previous row values before scanning (avoids stale data on nil columns).
 		for i := range scanDest {
-			scanDest[i] = new(any)
+			scanDest[i] = nil
 		}
 
-		if err := rows.Scan(scanDest...); err != nil {
+		if err := rows.Scan(scanPtrs...); err != nil {
 			return nil, fmt.Errorf("scanning row: %w", err)
 		}
 
 		rowMap := make(map[string]any, len(columns))
 		for i, col := range columns {
-			value := *(scanDest[i].(*any))
-			rowMap[col] = convertDB2Value(value, columnTypes[i])
+			rowMap[col] = convertDB2Value(scanDest[i], columnTypes[i])
 		}
 
 		result = append(result, rowMap)
