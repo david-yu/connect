@@ -14,9 +14,14 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// db2IdentifierRE matches valid DB2 identifiers that are safe to embed in SQL
+// without quoting: non-empty, first char letter or underscore, rest alphanumeric or underscore.
+var db2IdentifierRE = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 
 // StreamConfig holds configuration for the CDC streaming phase.
 type StreamConfig struct {
@@ -78,14 +83,22 @@ func NewStreamer(db *sql.DB, config StreamConfig, version Version) *Streamer {
 	}
 }
 
+// isValidDB2IdentifierInternal reports whether s is safe to embed in SQL strings:
+// non-empty, first char letter or underscore, remaining chars alphanumeric or underscore.
+func isValidDB2IdentifierInternal(s string) bool {
+	return db2IdentifierRE.MatchString(s)
+}
+
 // Initialize discovers the change tables for all monitored tables from IBMSNAP_REGISTER.
 // When config.Tables is empty, all registered tables for the schema are discovered dynamically.
 // config.TableFilter (if set) narrows the discovered or configured set.
 func (s *Streamer) Initialize(ctx context.Context) error {
+	if !isValidDB2IdentifierInternal(s.config.Schema) {
+		return fmt.Errorf("invalid schema %q: must be non-empty uppercase alphanumeric+underscore", s.config.Schema)
+	}
+
 	cdcSchema := s.config.asncdcSchema()
 
-	// Schema is validated as uppercase alphanumeric + underscore at config-parse time
-	// (isValidDB2Identifier in input_db2_cdc.go), so direct embedding is safe.
 	query := fmt.Sprintf(`
 		SELECT SOURCE_OWNER, SOURCE_TABLE, CD_OWNER, CD_TABLE
 		FROM %s.IBMSNAP_REGISTER

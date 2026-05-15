@@ -48,11 +48,10 @@ const (
 	db2CDCFieldEmitSchemaChanges        = "emit_schema_changes"
 	db2CDCFieldSignalTable              = "signal_table"
 
-	// db2CDCEventChanBuf is the number of change events buffered between the
-	// background CDC goroutine and ReadBatch. Sized to allow one poll batch to be
-	// queued without back-pressure so that the CDC loop does not stall waiting for
-	// the consumer.
-	db2CDCEventChanBuf = 100
+	// db2CDCEventChanBuf sizes the event channel. A larger buffer allows the
+	// streamer to run ahead of ReadBatch consumers; drain logic caps batch size
+	// at PollBatchSize so this needs to hold at least one full poll round.
+	db2CDCEventChanBuf = 1000
 )
 
 type snapshotMode string
@@ -366,11 +365,12 @@ type db2CDCInput struct {
 	eventChan chan replication.ChangeEvent
 	errChan   chan error
 
-	res     *service.Resources
-	shutSig *shutdown.Signaller
-	wg      sync.WaitGroup
-	mu      sync.Mutex
-	closed  bool
+	res       *service.Resources
+	shutSig   *shutdown.Signaller
+	cdcCancel context.CancelFunc // cancels cdcCtx on hard stop
+	wg        sync.WaitGroup
+	mu        sync.Mutex
+	closed    bool
 
 	version replication.Version
 	log     *service.Logger
@@ -492,6 +492,9 @@ func newDB2CDCInput(conf *service.ParsedConfig, mgr *service.Resources) (service
 	streamBackoffInterval, err := conf.FieldDuration(db2CDCFieldStreamBackoffInterval)
 	if err != nil {
 		return nil, err
+	}
+	if streamBackoffInterval <= 0 {
+		return nil, fmt.Errorf("stream_backoff_interval must be positive, got %v", streamBackoffInterval)
 	}
 
 	pollBatchSize, err := conf.FieldInt(db2CDCFieldPollBatchSize)
@@ -687,7 +690,8 @@ func (d *db2CDCInput) Connect(ctx context.Context) error {
 
 	// Derive a long-lived context from the shutdown signaller, not from the Connect
 	// ctx which callers may cancel once Connect returns.
-	cdcCtx, _ := d.shutSig.SoftStopCtx(context.Background())
+	cdcCtx, cdcCancel := d.shutSig.SoftStopCtx(context.Background())
+	d.cdcCancel = cdcCancel
 
 	d.wg.Add(1)
 	go d.runCDC(cdcCtx)
@@ -720,46 +724,78 @@ func (d *db2CDCInput) determineCheckpointMode() (string, error) {
 }
 
 func (d *db2CDCInput) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
+	// Block until at least one event is available.
+	var firstEvent replication.ChangeEvent
 	select {
-	case event := <-d.eventChan:
+	case firstEvent = <-d.eventChan:
+	case err := <-d.errChan:
+		return nil, nil, err
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	case <-d.shutSig.SoftStopChan():
+		return nil, nil, service.ErrEndOfInput
+	}
+
+	// Drain additional events non-blocking up to PollBatchSize.
+	rawEvents := make([]replication.ChangeEvent, 0, d.streamConfig.PollBatchSize)
+	rawEvents = append(rawEvents, firstEvent)
+drainLoop:
+	for len(rawEvents) < d.streamConfig.PollBatchSize {
+		select {
+		case ev := <-d.eventChan:
+			rawEvents = append(rawEvents, ev)
+		default:
+			break drainLoop
+		}
+	}
+
+	// Convert events to messages and track each CSN.
+	// All-or-nothing: if ackErr != nil, no resolveFn is called so the Capped
+	// watermark cannot advance past unprocessed messages. AutoRetryNacks
+	// redelivers by calling the same ackFunc with nil on retry.
+	batch := make(service.MessageBatch, 0, len(rawEvents))
+	resolveFns := make([]func() *replication.CSN, 0, len(rawEvents))
+
+	for _, event := range rawEvents {
 		msg, err := d.eventToMessage(event)
 		if err != nil {
 			return nil, nil, err
 		}
-
-		// Track the CSN before delivering the message so the Capped checkpoint knows it is in-flight.
 		var resolveFn func() *replication.CSN
 		if !event.CSN.IsNull() {
 			if resolveFn, err = d.capped.Track(ctx, event.CSN, 1); err != nil {
 				return nil, nil, fmt.Errorf("tracking CSN: %w", err)
 			}
 		}
+		batch = append(batch, msg)
+		resolveFns = append(resolveFns, resolveFn)
+	}
 
-		ackFunc := func(ctx context.Context, ackErr error) error {
-			if resolveFn == nil {
-				return nil
-			}
-			// Always release the in-flight slot to avoid deadlocking the Capped
-			// tracker. Only persist the checkpoint when the ack succeeded.
-			if highestCSN := resolveFn(); highestCSN != nil && ackErr == nil {
-				if err := d.saveCheckpoint(ctx, *highestCSN); err != nil {
-					d.log.Warnf("failed to save checkpoint: %v", err)
-				}
-			}
+	ackFunc := func(ctx context.Context, ackErr error) error {
+		if ackErr != nil {
+			// All-or-nothing: do not advance any Capped slot on batch failure.
+			// AutoRetryNacks will redeliver the entire batch.
 			return nil
 		}
-
-		return service.MessageBatch{msg}, ackFunc, nil
-
-	case err := <-d.errChan:
-		return nil, nil, err
-
-	case <-ctx.Done():
-		return nil, nil, ctx.Err()
-
-	case <-d.shutSig.SoftStopChan():
-		return nil, nil, service.ErrEndOfInput
+		// Call resolveFns in order; checkpoint only the highest resolved CSN.
+		var highest *replication.CSN
+		for _, fn := range resolveFns {
+			if fn == nil {
+				continue
+			}
+			if h := fn(); h != nil {
+				highest = h
+			}
+		}
+		if highest != nil {
+			if err := d.saveCheckpoint(ctx, *highest); err != nil {
+				d.log.Warnf("failed to save checkpoint: %v", err)
+			}
+		}
+		return nil
 	}
+
+	return batch, ackFunc, nil
 }
 
 func (d *db2CDCInput) Close(ctx context.Context) error {
@@ -784,6 +820,9 @@ func (d *db2CDCInput) Close(ctx context.Context) error {
 	case <-ctx.Done():
 		d.log.Warnf("context cancelled while waiting for CDC goroutines to stop: %v", ctx.Err())
 		d.shutSig.TriggerHardStop()
+		if d.cdcCancel != nil {
+			d.cdcCancel()
+		}
 	}
 
 	d.mu.Lock()
@@ -883,18 +922,31 @@ func (d *db2CDCInput) runStreaming(ctx context.Context) error {
 		return fmt.Errorf("initializing streamer: %w", err)
 	}
 
+	// Pre-register all sub-goroutine counts before launching any. This prevents
+	// a race where Close()'s wg.Wait() completes between individual wg.Add+go pairs.
+	addCount := 0
 	if d.heartbeatInterval > 0 {
-		d.wg.Add(1)
+		addCount++
+	}
+	if d.emitSchemaChanges {
+		addCount++
+	}
+	if d.signalTable != "" {
+		addCount++
+	}
+	if addCount > 0 {
+		d.wg.Add(addCount)
+	}
+
+	if d.heartbeatInterval > 0 {
 		go d.runHeartbeat(ctx)
 	}
 
 	if d.emitSchemaChanges {
-		d.wg.Add(1)
 		go d.pollSchemaChanges(ctx)
 	}
 
 	if d.signalTable != "" {
-		d.wg.Add(1)
 		go d.pollSignals(ctx)
 	}
 
@@ -957,7 +1009,12 @@ func (d *db2CDCInput) pollSchemaChanges(ctx context.Context) {
 }
 
 func (d *db2CDCInput) checkForSchemaChanges(ctx context.Context) error {
-	byteLen := 10
+	// CommitSeqByteLen is 10 for DB2 ≤11.x and 16 for DB2 12.1+.
+	// Using CommitSeqByteLen ensures the hex literal matches the column width.
+	byteLen := d.streamConfig.CommitSeqByteLen
+	if byteLen <= 0 {
+		byteLen = 10
+	}
 	lastHex := d.lastSeenSynchCSN.SQLHex(byteLen)
 
 	// Ported from Debezium LuwPlatform.java getListOfNewCdcEnabledTablesQuery.
@@ -980,6 +1037,7 @@ func (d *db2CDCInput) checkForSchemaChanges(ctx context.Context) error {
 		var srcOwner, srcTable string
 		var synchBytes []byte
 		if err := rows.Scan(&srcOwner, &srcTable, &synchBytes); err != nil {
+			d.log.Warnf("scanning schema change row: %v", err)
 			continue
 		}
 		csn := replication.NewCSNFromDBValue(synchBytes)
@@ -992,6 +1050,9 @@ func (d *db2CDCInput) checkForSchemaChanges(ctx context.Context) error {
 			CSN:       csn,
 			Timestamp: time.Now().UTC(),
 		}
+		// Note: s.changeTables is not updated here. Tables added via ASNCDC.ADDTABLE
+		// are reported as schema_change events but not polled until the connector
+		// restarts. A future Streamer.AddTable() API would enable hot-add without restart.
 		select {
 		case d.eventChan <- event:
 		case <-ctx.Done():
@@ -1004,7 +1065,9 @@ func (d *db2CDCInput) checkForSchemaChanges(ctx context.Context) error {
 // initSignalTable creates the signal table in DB2 if it does not exist.
 func (d *db2CDCInput) initSignalTable(ctx context.Context) error {
 	if parts := strings.SplitN(d.signalTable, ".", 2); len(parts) == 2 {
-		_, _ = d.auxDB.ExecContext(ctx, "CREATE SCHEMA "+parts[0])
+		if _, err := d.auxDB.ExecContext(ctx, "CREATE SCHEMA "+parts[0]); err != nil && !isAlreadyExistsError(err) {
+			return fmt.Errorf("creating schema %q: %w", parts[0], err)
+		}
 	}
 	_, err := d.auxDB.ExecContext(ctx, fmt.Sprintf(`
 		CREATE TABLE %s (
@@ -1061,6 +1124,7 @@ func (d *db2CDCInput) processSignals(ctx context.Context) error {
 		var id string
 		var data sql.NullString
 		if err := rows.Scan(&id, &data); err != nil {
+			d.log.Warnf("scanning signal row: %v", err)
 			continue
 		}
 		pending = append(pending, pendingSignal{id: id, data: data.String})

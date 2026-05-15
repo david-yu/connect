@@ -10,7 +10,6 @@ package replication
 
 import (
 	"context"
-	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"strings"
@@ -23,31 +22,6 @@ import (
 // ---------------------------------------------------------------------------
 // Pure-function tests (no DB)
 // ---------------------------------------------------------------------------
-
-func TestParseIsolationLevel(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		input string
-		want  sql.IsolationLevel
-	}{
-		{"READ UNCOMMITTED", sql.LevelReadUncommitted},
-		{"read uncommitted", sql.LevelReadUncommitted},
-		{"READ COMMITTED", sql.LevelReadCommitted},
-		{"REPEATABLE READ", sql.LevelRepeatableRead},
-		{"SERIALIZABLE", sql.LevelSerializable},
-		{"", sql.LevelRepeatableRead},        // default
-		{"UNKNOWN", sql.LevelRepeatableRead}, // default
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.input, func(t *testing.T) {
-			t.Parallel()
-			s := &Snapshotter{config: SnapshotConfig{IsolationLevel: tc.input}}
-			assert.Equal(t, tc.want, s.parseIsolationLevel())
-		})
-	}
-}
 
 func TestConvertDB2Value(t *testing.T) {
 	t.Parallel()

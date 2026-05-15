@@ -785,15 +785,15 @@ func TestPollChangeTableFullBatchWithPairedUpdates(t *testing.T) {
 				}, nil
 			}
 			return []string{
-				"IBMSNAP_OPCODE",
-				"IBMSNAP_COMMITSEQ", "IBMSNAP_INTENTSEQ", "IBMSNAP_OPERATION", "IBMSNAP_LOGMARKER",
-				"ID", "VAL",
-			}, [][]driver.Value{
-				{int64(3), sharedCSN, int64(1), "D", ts, int64(1), int64(100)}, // pair 1 before
-				{int64(4), sharedCSN, int64(2), "I", ts, int64(1), int64(101)}, // pair 1 after
-				{int64(3), sharedCSN, int64(3), "D", ts, int64(2), int64(200)}, // pair 2 before
-				{int64(4), sharedCSN, int64(4), "I", ts, int64(2), int64(201)}, // pair 2 after
-			}, nil
+					"IBMSNAP_OPCODE",
+					"IBMSNAP_COMMITSEQ", "IBMSNAP_INTENTSEQ", "IBMSNAP_OPERATION", "IBMSNAP_LOGMARKER",
+					"ID", "VAL",
+				}, [][]driver.Value{
+					{int64(3), sharedCSN, int64(1), "D", ts, int64(1), int64(100)}, // pair 1 before
+					{int64(4), sharedCSN, int64(2), "I", ts, int64(1), int64(101)}, // pair 1 after
+					{int64(3), sharedCSN, int64(3), "D", ts, int64(2), int64(200)}, // pair 2 before
+					{int64(4), sharedCSN, int64(4), "I", ts, int64(2), int64(201)}, // pair 2 after
+				}, nil
 		},
 	})
 

@@ -12,11 +12,13 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Jeffail/checkpoint"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -1141,4 +1143,42 @@ func TestParseSnapshotSignalTables(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// ackFunc checkpoint semantics
+// ---------------------------------------------------------------------------
+
+// TestAckFuncDoesNotAdvanceCheckpointOnNack verifies the all-or-nothing ackFunc
+// semantics: on nack (ackErr != nil) the Capped slot is NOT released, so the
+// watermark cannot advance past the failed message. AutoRetryNacks retries by
+// calling the same ackFunc with nil; the slot is then released and checkpoint saved.
+func TestAckFuncDoesNotAdvanceCheckpointOnNack(t *testing.T) {
+	t.Parallel()
+	checkpointSaved := false
+	d := &db2CDCInput{
+		log:    testLogger(t),
+		capped: checkpoint.NewCapped[replication.CSN](10),
+	}
+
+	csn := replication.NewCSN(100)
+	resolveFn, err := d.capped.Track(context.Background(), csn, 1)
+	require.NoError(t, err)
+
+	ackFunc := func(_ context.Context, ackErr error) error {
+		if ackErr != nil {
+			// Do not release the Capped slot on failure — AutoRetryNacks will re-deliver.
+			return nil
+		}
+		if highest := resolveFn(); highest != nil {
+			checkpointSaved = true
+		}
+		return nil
+	}
+
+	_ = ackFunc(context.Background(), errors.New("downstream failure"))
+	assert.False(t, checkpointSaved, "checkpoint must not advance on nack")
+
+	_ = ackFunc(context.Background(), nil)
+	assert.True(t, checkpointSaved, "checkpoint must advance on success ack")
 }

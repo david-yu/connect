@@ -63,13 +63,24 @@ func NewSnapshotter(db *sql.DB, config SnapshotConfig, version Version) *Snapsho
 // Snapshot reads all rows from each configured table and returns the CSN that
 // streaming should resume from (captured before the first table is read).
 func (s *Snapshotter) Snapshot(ctx context.Context, handler func(event ChangeEvent) error) (CSN, error) {
+	if !isValidDB2IdentifierInternal(s.config.Schema) {
+		return CSN{}, fmt.Errorf("invalid schema %q: must be non-empty uppercase alphanumeric+underscore", s.config.Schema)
+	}
+
+	// sql.LevelSerializable maps to DB2 "RR" (Repeatable Read — no phantoms).
+	// sql.LevelRepeatableRead maps to DB2 "RS" (Read Stability — phantoms allowed),
+	// which is weaker than intended. Use Serializable for correct snapshot isolation.
+	// Full fix (SET CURRENT ISOLATION RR per statement) is tracked separately.
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
-		Isolation: s.parseIsolationLevel(),
+		Isolation: sql.LevelSerializable,
 		ReadOnly:  true,
 	})
 	if err != nil {
 		return CSN{}, fmt.Errorf("beginning snapshot transaction: %w", err)
 	}
+	// Note: this transaction holds the sole connection in db's pool (SetMaxOpenConns(1)).
+	// Any concurrent caller (schema-change polling, signal processing) blocks until this
+	// transaction commits. Full fix requires a separate db handle for snapshot queries.
 	defer tx.Rollback() //nolint:errcheck
 
 	startCSN, err := s.captureCurrentCSN(ctx, tx)
@@ -335,22 +346,6 @@ func (s *Snapshotter) fetchBatch(ctx context.Context, tx *sql.Tx, tableName stri
 	}
 
 	return result, rows.Err()
-}
-
-// parseIsolationLevel converts a string isolation level to sql.IsolationLevel.
-func (s *Snapshotter) parseIsolationLevel() sql.IsolationLevel {
-	switch strings.ToUpper(s.config.IsolationLevel) {
-	case "READ UNCOMMITTED":
-		return sql.LevelReadUncommitted
-	case "READ COMMITTED":
-		return sql.LevelReadCommitted
-	case "REPEATABLE READ":
-		return sql.LevelRepeatableRead
-	case "SERIALIZABLE":
-		return sql.LevelSerializable
-	default:
-		return sql.LevelRepeatableRead
-	}
 }
 
 // convertDB2Value converts a DB2 driver value to a JSON-serializable Go type.
