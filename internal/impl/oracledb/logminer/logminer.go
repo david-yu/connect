@@ -271,19 +271,17 @@ func (lm *LogMiner) processRedoEvent(ctx context.Context, redoEvent *sqlredo.Red
 
 		lm.txnCache.AddEvent(redoEvent.TransactionID, redoEvent.SCN, &event)
 
-	case sqlredo.OpSelectLobLocator, sqlredo.OpLobTrim:
+	case sqlredo.OpSelectLobLocator:
 		if !lm.cfg.LOBEnabled {
 			return nil
 		}
 		if !redoEvent.SQLRedo.Valid || redoEvent.SQLRedo.String == "" {
-			lm.log.Warnf("Skipping %s with no SQL_REDO (scn=%d, txn=%s)", redoEvent.Operation, redoEvent.SCN, redoEvent.TransactionID)
+			lm.log.Warnf("Skipping SELECT_LOB_LOCATOR with no SQL_REDO (scn=%d, txn=%s)", redoEvent.SCN, redoEvent.TransactionID)
 			return nil
 		}
-		// LOB_TRIM SQL has the same SELECT "COL" INTO ... FROM "SCHEMA"."TABLE" WHERE ...
-		// structure as SELECT_LOB_LOCATOR, so the same parser works for both.
 		info, err := sqlredo.ParseSelectLobLocator(redoEvent.SQLRedo.String)
 		if err != nil {
-			lm.log.Warnf("Failed to parse %s SQL (scn=%d, txn=%s): %v\nSQL: %.500s", redoEvent.Operation, redoEvent.SCN, redoEvent.TransactionID, err, redoEvent.SQLRedo.String)
+			lm.log.Warnf("Failed to parse SELECT_LOB_LOCATOR SQL (scn=%d, txn=%s): %v\nSQL: %.500s", redoEvent.SCN, redoEvent.TransactionID, err, redoEvent.SQLRedo.String)
 			return nil
 		}
 		// Resolve LOB type from the schema cache populated at startup.
@@ -307,6 +305,22 @@ func (lm *LogMiner) processRedoEvent(ctx context.Context, redoEvent *sqlredo.Red
 			}
 		}
 		state.ActiveKey = &key
+
+	case sqlredo.OpLobTrim:
+		if !lm.cfg.LOBEnabled {
+			return nil
+		}
+		// LOB_TRIM (op 11) truncates the LOB identified by the preceding SELECT_LOB_LOCATOR.
+		// Its SQL redo is dbms_lob.trim(loc_b, N) — it carries no schema/table/column info,
+		// so we rely on the active key already established by SELECT_LOB_LOCATOR.
+		// Clear accumulated fragments so that subsequent LOB_WRITE calls start with a clean slate.
+		state, exists := lm.lobStates[redoEvent.TransactionID]
+		if !exists || state.ActiveKey == nil {
+			return nil
+		}
+		if acc := state.Accumulators[*state.ActiveKey]; acc != nil {
+			acc.Fragments = acc.Fragments[:0]
+		}
 
 	case sqlredo.OpLobWrite:
 		if !lm.cfg.LOBEnabled {
