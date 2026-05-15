@@ -814,6 +814,290 @@ func TestPollChangeTableFullBatchWithPairedUpdates(t *testing.T) {
 	require.Len(t, events2, 2, "pollChanges must return 2 merged update events")
 }
 
+// TestPollChangeTableMultipleDeletesSameTable verifies that multiple DELETE
+// operations on the same table within one poll batch each produce an
+// independent OpTypeDelete event with the correct before-image data.
+//
+// This corresponds to Debezium's deleteWithoutTombstone test, which executes
+// "DELETE FROM tableB" to remove N rows in a single transaction and asserts
+// that each delete event carries the deleted row's column values in the
+// before-image. In our model the before-image is in Data (not BeforeData)
+// for DELETE events — consistent with the Debezium "before" field mapping.
+func TestPollChangeTableMultipleDeletesSameTable(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Now().Truncate(time.Second)
+	csnBytes := []byte{0, 0, 0, 0, 0, 0, 0, 10} // single transaction CSN
+
+	db := openFakeDB(t, &replFakeHandlers{
+		query: func(_ string, _ []driver.Value) ([]string, [][]driver.Value, error) {
+			return []string{
+				"IBMSNAP_COMMITSEQ", "IBMSNAP_INTENTSEQ", "IBMSNAP_OPERATION", "IBMSNAP_LOGMARKER",
+				"ID", "COLB",
+			}, [][]driver.Value{
+				// 5 rows deleted in the same transaction (same CSN, ascending IntentSeq)
+				{csnBytes, int64(1), "D", ts, int64(10), "b"},
+				{csnBytes, int64(2), "D", ts, int64(11), "b"},
+				{csnBytes, int64(3), "D", ts, int64(12), "b"},
+				{csnBytes, int64(4), "D", ts, int64(13), "b"},
+				{csnBytes, int64(5), "D", ts, int64(14), "b"},
+			}, nil
+		},
+	})
+
+	s := NewStreamer(db, StreamConfig{Schema: "DB2INST1", PollBatchSize: 100}, Version{})
+	events, _, err := s.pollChangeTable(context.Background(), "TABLEB", "ASNCDC.TABLEB_CT",
+		NewCSN(0), 0, NewCSN(99999))
+
+	require.NoError(t, err)
+	require.Len(t, events, 5, "each deleted row must produce one OpTypeDelete event")
+
+	for i, evt := range events {
+		assert.Equal(t, OpTypeDelete, evt.Operation, "event %d must be a delete", i)
+		assert.Equal(t, uint64(10), evt.CSN.Uint64(), "all deletes share the same transaction CSN")
+		assert.Equal(t, int64(i+1), evt.IntentSeq, "intent seq must be sequential")
+		assert.Equal(t, int64(10+i), evt.Data["ID"], "before-image ID must match deleted row")
+		assert.Equal(t, "b", evt.Data["COLB"], "before-image COLB must match deleted row")
+		assert.Nil(t, evt.BeforeData, "DELETE events must have nil BeforeData (before-image is in Data)")
+	}
+}
+
+// TestPollChangeTablePrimaryKeyUpdate verifies that an UPDATE which changes the
+// primary key column is correctly captured as a D+I pair (not as a phantom delete
+// followed by an unrelated insert).
+//
+// This mirrors Debezium's updatePrimaryKey test: UPDATE tablea SET id=100 WHERE id=1
+// produces a D row with the old pk value and an I row with the new pk value, both
+// sharing the same IBMSNAP_COMMITSEQ. The connector emits these as OpTypeDelete
+// (before-image, old pk=1) and OpTypeInsert (after-image, new pk=100).
+//
+// Note: DB2 LUW SQL Replication does NOT encode PK updates differently from
+// regular updates. An UPDATE to a PK column still produces a D+I pair in the
+// change table with the same COMMITSEQ. pairOpcodeEvents then merges the pair
+// into OpTypeUpdate with BeforeData populated.
+func TestPollChangeTablePrimaryKeyUpdate(t *testing.T) {
+	t.Parallel()
+
+	sharedCSN := []byte{0, 0, 0, 0, 0, 0, 0, 77}
+	ts := time.Now().Truncate(time.Second)
+
+	db := openFakeDB(t, &replFakeHandlers{
+		query: func(_ string, _ []driver.Value) ([]string, [][]driver.Value, error) {
+			// IBMSNAP_OPCODE=3 (update-before) + 4 (update-after) detect a PK-update pair.
+			return []string{
+				"IBMSNAP_OPCODE",
+				"IBMSNAP_COMMITSEQ", "IBMSNAP_INTENTSEQ", "IBMSNAP_OPERATION", "IBMSNAP_LOGMARKER",
+				"ID", "COLA",
+			}, [][]driver.Value{
+				{int64(3), sharedCSN, int64(1), "D", ts, int64(1), "a"},   // before: id=1
+				{int64(4), sharedCSN, int64(2), "I", ts, int64(100), "a"}, // after: id=100
+			}, nil
+		},
+	})
+
+	s := NewStreamer(db, StreamConfig{Schema: "DB2INST1", PollBatchSize: 100}, Version{})
+	events, _, err := s.pollChangeTable(context.Background(), "TABLEA", "ASNCDC.TABLEA_CT",
+		NewCSN(0), 0, NewCSN(99999))
+
+	require.NoError(t, err)
+	require.Len(t, events, 1, "D+I pair for PK update must merge into a single OpTypeUpdate event")
+
+	evt := events[0]
+	assert.Equal(t, OpTypeUpdate, evt.Operation)
+	assert.Equal(t, uint64(77), evt.CSN.Uint64())
+
+	// After-image: new pk=100
+	assert.Equal(t, int64(100), evt.Data["ID"], "Data must contain the after-image (new pk)")
+	assert.Equal(t, "a", evt.Data["COLA"])
+
+	// Before-image: old pk=1
+	require.NotNil(t, evt.BeforeData, "BeforeData must be populated for PK update")
+	assert.Equal(t, int64(1), evt.BeforeData["ID"], "BeforeData must contain the before-image (old pk)")
+	assert.Equal(t, "a", evt.BeforeData["COLA"])
+}
+
+// TestPollChangeTableNullColumnsInCDCRows verifies that NULL column values in
+// CDC change table rows (not snapshot rows) are represented as nil in the
+// Data map. This is distinct from TestSnapshotNULLColumnValues which tests
+// snapshot null handling. Change table rows also carry NULL for optional columns.
+//
+// Scenario: UPDATE employees SET manager_id = NULL WHERE id = 5.
+// The after-image I row has manager_id = NULL; the before-image D row had a value.
+func TestPollChangeTableNullColumnsInCDCRows(t *testing.T) {
+	t.Parallel()
+
+	ts := time.Now().Truncate(time.Second)
+	csnBytes := []byte{0, 0, 0, 0, 0, 0, 0, 55}
+
+	db := openFakeDB(t, &replFakeHandlers{
+		query: func(_ string, _ []driver.Value) ([]string, [][]driver.Value, error) {
+			return []string{
+				"IBMSNAP_OPCODE",
+				"IBMSNAP_COMMITSEQ", "IBMSNAP_INTENTSEQ", "IBMSNAP_OPERATION", "IBMSNAP_LOGMARKER",
+				"ID", "MANAGER_ID", "DEPT",
+			}, [][]driver.Value{
+				// before: manager_id was 42, dept was "ENG"
+				{int64(3), csnBytes, int64(1), "D", ts, int64(5), int64(42), "ENG"},
+				// after: manager_id set to NULL, dept set to NULL
+				{int64(4), csnBytes, int64(2), "I", ts, int64(5), nil, nil},
+			}, nil
+		},
+	})
+
+	s := NewStreamer(db, StreamConfig{Schema: "MYSCHEMA", PollBatchSize: 100}, Version{})
+	events, _, err := s.pollChangeTable(context.Background(), "EMPLOYEES", "ASNCDC.EMPLOYEES_CT",
+		NewCSN(0), 0, NewCSN(99999))
+
+	require.NoError(t, err)
+	require.Len(t, events, 1, "D+I pair must merge into one update event")
+
+	evt := events[0]
+	assert.Equal(t, OpTypeUpdate, evt.Operation)
+
+	// After-image: NULL columns must appear as nil (present key, nil value).
+	managerAfter, managerAfterExists := evt.Data["MANAGER_ID"]
+	assert.True(t, managerAfterExists, "MANAGER_ID must be present in Data even when NULL")
+	assert.Nil(t, managerAfter, "NULL after-image value must be nil in Data")
+
+	deptAfter, deptAfterExists := evt.Data["DEPT"]
+	assert.True(t, deptAfterExists, "DEPT must be present in Data even when NULL")
+	assert.Nil(t, deptAfter, "NULL after-image value must be nil in Data")
+
+	// Before-image: non-null values must be preserved in BeforeData.
+	require.NotNil(t, evt.BeforeData)
+	assert.Equal(t, int64(42), evt.BeforeData["MANAGER_ID"], "before-image must preserve the original manager_id")
+	assert.Equal(t, "ENG", evt.BeforeData["DEPT"])
+}
+
+// TestPollChangeTableMultipleInsertsSharedCSN verifies that N INSERT events
+// sharing the same IBMSNAP_COMMITSEQ (a single transaction with N inserts) are
+// all emitted in ascending IBMSNAP_INTENTSEQ order. This mirrors the Debezium
+// test pattern where a loop inserts N rows in a single commit and expects N
+// sequential INSERT events ordered by their position within the transaction.
+func TestPollChangeTableMultipleInsertsSharedCSN(t *testing.T) {
+	t.Parallel()
+
+	sharedCSN := []byte{0, 0, 0, 0, 0, 0, 0, 99}
+	ts := time.Now().Truncate(time.Second)
+
+	db := openFakeDB(t, &replFakeHandlers{
+		query: func(_ string, _ []driver.Value) ([]string, [][]driver.Value, error) {
+			return []string{
+				"IBMSNAP_COMMITSEQ", "IBMSNAP_INTENTSEQ", "IBMSNAP_OPERATION", "IBMSNAP_LOGMARKER",
+				"ID", "COLA",
+			}, [][]driver.Value{
+				{sharedCSN, int64(1), "I", ts, int64(10), "a"},
+				{sharedCSN, int64(2), "I", ts, int64(11), "a"},
+				{sharedCSN, int64(3), "I", ts, int64(12), "a"},
+				{sharedCSN, int64(4), "I", ts, int64(13), "a"},
+				{sharedCSN, int64(5), "I", ts, int64(14), "a"},
+			}, nil
+		},
+	})
+
+	s := NewStreamer(db, StreamConfig{Schema: "DB2INST1", PollBatchSize: 100}, Version{})
+	events, rawCount, err := s.pollChangeTable(context.Background(), "TABLEA", "ASNCDC.TABLEA_CT",
+		NewCSN(0), 0, NewCSN(99999))
+
+	require.NoError(t, err)
+	assert.Equal(t, 5, rawCount, "raw row count must equal the number of rows returned")
+	require.Len(t, events, 5, "all 5 inserts from the same transaction must be emitted")
+
+	for i, evt := range events {
+		assert.Equal(t, OpTypeInsert, evt.Operation, "event %d must be an insert", i)
+		assert.Equal(t, uint64(99), evt.CSN.Uint64(), "all events share the transaction CSN")
+		assert.Equal(t, int64(i+1), evt.IntentSeq, "events must be ordered by IntentSeq")
+		assert.Equal(t, int64(10+i), evt.Data["ID"])
+	}
+}
+
+// TestInitializeWithTableFilter verifies that a TableFilter applied during
+// Initialize restricts which registered tables are monitored. Tables that
+// match the filter become CDC-monitored; those that do not are silently skipped
+// even when present in IBMSNAP_REGISTER.
+//
+// This mirrors Debezium's testTableIncludeList/testTableExcludeList behaviour:
+// the connector only tracks tables that pass the filter predicate.
+func TestInitializeWithTableFilter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		registered   [][]driver.Value // rows from IBMSNAP_REGISTER
+		filter       func(string) bool
+		wantTables   []string
+		wantFiltered []string // tables that must NOT appear in changeTables
+		wantErr      bool
+	}{
+		{
+			name: "filter allows only one table",
+			registered: [][]driver.Value{
+				{"MYSCHEMA", "TABLEA", "ASNCDC", "TABLEA_CT"},
+				{"MYSCHEMA", "TABLEB", "ASNCDC", "TABLEB_CT"},
+			},
+			filter:       func(t string) bool { return t == "TABLEA" },
+			wantTables:   []string{"TABLEA"},
+			wantFiltered: []string{"TABLEB"},
+		},
+		{
+			name: "filter rejects all tables returns error",
+			registered: [][]driver.Value{
+				{"MYSCHEMA", "TABLEA", "ASNCDC", "TABLEA_CT"},
+			},
+			filter:  func(_ string) bool { return false },
+			wantErr: true,
+		},
+		{
+			name: "nil filter allows all tables",
+			registered: [][]driver.Value{
+				{"MYSCHEMA", "TABLEA", "ASNCDC", "TABLEA_CT"},
+				{"MYSCHEMA", "TABLEB", "ASNCDC", "TABLEB_CT"},
+			},
+			filter:     nil,
+			wantTables: []string{"TABLEA", "TABLEB"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			db := openFakeDB(t, &replFakeHandlers{
+				query: func(q string, _ []driver.Value) ([]string, [][]driver.Value, error) {
+					if strings.Contains(q, "SOURCE_OWNER") {
+						return []string{"SOURCE_OWNER", "SOURCE_TABLE", "CD_OWNER", "CD_TABLE"},
+							tc.registered, nil
+					}
+					// detectCommitSeqByteLen
+					return []string{"LENGTH"}, [][]driver.Value{{int64(10)}}, nil
+				},
+			})
+
+			s := NewStreamer(db, StreamConfig{
+				Schema:      "MYSCHEMA",
+				TableFilter: tc.filter,
+				// Tables is empty → dynamic discovery
+			}, Version{})
+
+			err := s.Initialize(context.Background())
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			for _, table := range tc.wantTables {
+				_, ok := s.changeTables[table]
+				assert.True(t, ok, "table %s must be registered after Initialize", table)
+			}
+			for _, table := range tc.wantFiltered {
+				_, ok := s.changeTables[table]
+				assert.False(t, ok, "table %s must NOT be registered (filtered out)", table)
+			}
+		})
+	}
+}
+
 // TestPollChangeTableCrossBatchUpdatePairing verifies cross-poll D+I pair merging (C3 fix).
 //
 // When PollBatchSize=1 and a D+I pair straddles two polls:

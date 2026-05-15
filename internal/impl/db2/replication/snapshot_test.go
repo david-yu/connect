@@ -678,6 +678,159 @@ func TestSnapshotNULLColumnValues(t *testing.T) {
 	assert.Nil(t, deptVal, "NULL column value must be nil in the Data map")
 }
 
+// TestSnapshotCompositePKKeysetPagination verifies that tables with composite
+// primary keys are paginated correctly using multi-column keyset pagination.
+// The WHERE clause must use tuple comparison: (PK1, PK2) > (lastVal1, lastVal2).
+//
+// This corresponds to the Debezium "composite PK" scenario where a table with
+// two PK columns (e.g. id + region) must advance the page cursor using all PK
+// columns simultaneously to avoid re-reading rows.
+func TestSnapshotCompositePKKeysetPagination(t *testing.T) {
+	t.Parallel()
+
+	var capturedFetchQueries []string
+	queryCount := 0
+
+	db := openFakeDB(t, &replFakeHandlers{
+		query: func(q string, _ []driver.Value) ([]string, [][]driver.Value, error) {
+			queryCount++
+			if strings.Contains(q, "FETCH FIRST") {
+				capturedFetchQueries = append(capturedFetchQueries, q)
+			}
+			switch {
+			case strings.Contains(q, "SYNCHPOINT"):
+				return []string{"MAX(SYNCHPOINT)"}, [][]driver.Value{{nil}}, nil
+			case strings.Contains(q, "KEYCOLUSE"):
+				// Composite PK: (REGION_ID, EMP_ID) — two columns
+				return []string{"COLNAME"}, [][]driver.Value{{"REGION_ID"}, {"EMP_ID"}}, nil
+			case strings.Contains(q, "SYSCAT.COLUMNS"):
+				return []string{"COLNAME"}, [][]driver.Value{
+					{"REGION_ID"}, {"EMP_ID"}, {"NAME"},
+				}, nil
+			case strings.Contains(q, "FETCH FIRST"):
+				switch len(capturedFetchQueries) {
+				case 1: // first page
+					return []string{"REGION_ID", "EMP_ID", "NAME"}, [][]driver.Value{
+						{int64(1), int64(100), "Alice"},
+						{int64(1), int64(101), "Bob"},
+					}, nil
+				case 2: // second page
+					return []string{"REGION_ID", "EMP_ID", "NAME"}, [][]driver.Value{
+						{int64(2), int64(200), "Charlie"},
+					}, nil
+				default: // end of data
+					return []string{"REGION_ID", "EMP_ID", "NAME"}, nil, nil
+				}
+			}
+			return nil, nil, nil
+		},
+	})
+
+	s := NewSnapshotter(db, SnapshotConfig{
+		Schema:    "MYSCHEMA",
+		Tables:    []string{"EMPLOYEES"},
+		BatchSize: 2,
+	}, Version{})
+
+	var events []ChangeEvent
+	_, err := s.Snapshot(context.Background(), func(e ChangeEvent) error {
+		events = append(events, e)
+		return nil
+	})
+
+	require.NoError(t, err)
+	assert.Len(t, events, 3, "must receive all 3 rows across two pages")
+
+	require.Len(t, capturedFetchQueries, 3, "must issue 3 SELECT queries")
+
+	// First page: no WHERE clause
+	assert.NotContains(t, capturedFetchQueries[0], "WHERE",
+		"first page must not have a WHERE clause")
+
+	// Second page: composite tuple WHERE clause with both PK columns and placeholders
+	assert.Contains(t, capturedFetchQueries[1], "WHERE",
+		"second page must have a keyset WHERE clause")
+	assert.Contains(t, capturedFetchQueries[1], "REGION_ID",
+		"second page WHERE must reference the first PK column")
+	assert.Contains(t, capturedFetchQueries[1], "EMP_ID",
+		"second page WHERE must reference the second PK column")
+	assert.Contains(t, capturedFetchQueries[1], "?",
+		"second page WHERE must use parameter placeholders")
+}
+
+// TestSnapshotBlobAndClobColumns verifies that BLOB/binary columns in snapshot
+// rows are returned as raw []byte and CLOB/text columns as strings.
+//
+// This corresponds to the Debezium type propagation test (shouldPropagateSourceTypeByDatatype)
+// which verifies that binary and character large objects are decoded correctly.
+// Our connector uses convertDB2Value: CHAR/VARCHAR/CLOB/TEXT → string,
+// BLOB/binary → raw []byte (to be base64-encoded when marshalled to JSON).
+func TestSnapshotBlobAndClobColumns(t *testing.T) {
+	t.Parallel()
+
+	queryCount := 0
+	db := openFakeDB(t, &replFakeHandlers{
+		query: func(q string, _ []driver.Value) ([]string, [][]driver.Value, error) {
+			queryCount++
+			switch {
+			case strings.Contains(q, "SYNCHPOINT"):
+				return []string{"MAX(SYNCHPOINT)"}, [][]driver.Value{{nil}}, nil
+			case strings.Contains(q, "KEYCOLUSE"):
+				return []string{"COLNAME"}, [][]driver.Value{{"ID"}}, nil
+			case strings.Contains(q, "SYSCAT.COLUMNS"):
+				return []string{"COLNAME"}, [][]driver.Value{
+					{"ID"}, {"DOC_CONTENT"}, {"THUMBNAIL"}, {"TITLE"},
+				}, nil
+			case strings.Contains(q, "FETCH FIRST"):
+				if queryCount == 4 {
+					return []string{"ID", "DOC_CONTENT", "THUMBNAIL", "TITLE"}, [][]driver.Value{
+						{int64(1), []byte("hello world"), []byte{0xDE, 0xAD, 0xBE, 0xEF}, []byte("My Document")},
+					}, nil
+				}
+				return []string{"ID", "DOC_CONTENT", "THUMBNAIL", "TITLE"}, nil, nil
+			}
+			return nil, nil, nil
+		},
+		colTypes: func(_ string) map[string]string {
+			return map[string]string{
+				"ID":          "INTEGER",
+				"DOC_CONTENT": "CLOB",    // text large object → string
+				"THUMBNAIL":   "BLOB",    // binary large object → raw bytes
+				"TITLE":       "VARCHAR", // varchar → string
+			}
+		},
+	})
+
+	s := NewSnapshotter(db, SnapshotConfig{
+		Schema:    "MYSCHEMA",
+		Tables:    []string{"DOCUMENTS"},
+		BatchSize: 100,
+	}, Version{})
+
+	var events []ChangeEvent
+	_, err := s.Snapshot(context.Background(), func(e ChangeEvent) error {
+		events = append(events, e)
+		return nil
+	})
+
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+
+	row := events[0].Data
+
+	// CLOB content must be decoded to string (not raw bytes)
+	assert.Equal(t, "hello world", row["DOC_CONTENT"],
+		"CLOB columns must be decoded to string via convertDB2Value")
+
+	// BLOB content must remain as raw []byte
+	assert.Equal(t, []byte{0xDE, 0xAD, 0xBE, 0xEF}, row["THUMBNAIL"],
+		"BLOB columns must remain as raw []byte in the Data map")
+
+	// VARCHAR must also be decoded to string
+	assert.Equal(t, "My Document", row["TITLE"],
+		"VARCHAR columns must be decoded to string")
+}
+
 // TestSnapshotKeysetPaginationTwoPages verifies that large tables are paginated
 // using keyset pagination: the first page is fetched without a WHERE clause;
 // subsequent pages add "WHERE (PK) > (lastKeyValue)" to advance past rows

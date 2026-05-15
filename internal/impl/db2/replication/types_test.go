@@ -300,6 +300,138 @@ func TestChangeEvent(t *testing.T) {
 	})
 }
 
+// TestGetTimeStringParsing verifies that getTime correctly parses DB2 native
+// TIMESTAMP strings returned by the DB2 CLI driver (SQL_C_CHAR binding). The
+// CLI returns TIMESTAMP columns as "YYYY-MM-DD HH:MM:SS.ffffff" strings rather
+// than native time.Time values. Both the DB2 native format and RFC3339 must be
+// accepted; other string formats must return zero time.
+//
+// This mirrors Debezium's timestamp column handling: DB2 change table rows carry
+// IBMSNAP_LOGMARKER as a TIMESTAMP column which the CLI surfaces as a string.
+func TestGetTimeStringParsing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    any
+		wantZero bool
+		wantTime time.Time
+	}{
+		{
+			name:     "DB2 native timestamp format",
+			input:    "2024-05-15 10:30:45.123456",
+			wantZero: false,
+			wantTime: time.Date(2024, 5, 15, 10, 30, 45, 123456000, time.UTC),
+		},
+		{
+			name:     "DB2 native timestamp zero microseconds",
+			input:    "2024-01-01 00:00:00.000000",
+			wantZero: false,
+			wantTime: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:     "RFC3339 format accepted as fallback",
+			input:    "2024-05-15T10:30:45Z",
+			wantZero: false,
+			wantTime: time.Date(2024, 5, 15, 10, 30, 45, 0, time.UTC),
+		},
+		{
+			name:     "invalid string returns zero time",
+			input:    "not-a-timestamp",
+			wantZero: true,
+		},
+		{
+			name:     "nil returns zero time",
+			input:    nil,
+			wantZero: true,
+		},
+		{
+			name:     "time.Time pass-through",
+			input:    time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC),
+			wantZero: false,
+			wantTime: time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			v := tc.input
+			result := getTime(&v)
+			if tc.wantZero {
+				assert.True(t, result.IsZero(), "expected zero time for input %v", tc.input)
+			} else {
+				assert.Equal(t, tc.wantTime, result)
+			}
+		})
+	}
+}
+
+// TestPairOpcodeEventsNullColumns verifies that pairOpcodeEvents correctly merges
+// D+I pairs even when column values in Data are nil. The merged OpTypeUpdate event
+// must preserve nil entries (not omit them) in both Data and BeforeData maps.
+//
+// This corresponds to Debezium's null column handling: when a column is nullable
+// and NULL in the DB2 row, it appears as nil in the Data map. Merging before and
+// after images must not silently drop nil-valued keys.
+func TestPairOpcodeEventsNullColumns(t *testing.T) {
+	t.Parallel()
+
+	csn := NewCSN(50)
+
+	tests := []struct {
+		name          string
+		input         []ChangeEvent
+		wantData      map[string]any
+		wantBefore    map[string]any
+		wantOperation OpType
+	}{
+		{
+			name: "update sets column to null — nil preserved in Data",
+			input: []ChangeEvent{
+				{
+					CSN: csn, IntentSeq: 1, Operation: opTypeUpdateBefore,
+					Data: map[string]any{"ID": int64(5), "MANAGER_ID": int64(42), "DEPT": "ENG"},
+				},
+				{
+					CSN: csn, IntentSeq: 2, Operation: opTypeUpdateAfter,
+					Data: map[string]any{"ID": int64(5), "MANAGER_ID": nil, "DEPT": nil},
+				},
+			},
+			wantOperation: OpTypeUpdate,
+			wantData:      map[string]any{"ID": int64(5), "MANAGER_ID": nil, "DEPT": nil},
+			wantBefore:    map[string]any{"ID": int64(5), "MANAGER_ID": int64(42), "DEPT": "ENG"},
+		},
+		{
+			name: "update clears null — nil before, value after",
+			input: []ChangeEvent{
+				{
+					CSN: csn, IntentSeq: 1, Operation: opTypeUpdateBefore,
+					Data: map[string]any{"ID": int64(7), "SCORE": nil},
+				},
+				{
+					CSN: csn, IntentSeq: 2, Operation: opTypeUpdateAfter,
+					Data: map[string]any{"ID": int64(7), "SCORE": int64(100)},
+				},
+			},
+			wantOperation: OpTypeUpdate,
+			wantData:      map[string]any{"ID": int64(7), "SCORE": int64(100)},
+			wantBefore:    map[string]any{"ID": int64(7), "SCORE": nil},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			result := pairOpcodeEvents(tc.input)
+			require.Len(t, result, 1, "D+I pair must merge to a single event")
+			assert.Equal(t, tc.wantOperation, result[0].Operation)
+			assert.Equal(t, tc.wantData, result[0].Data)
+			assert.Equal(t, tc.wantBefore, result[0].BeforeData)
+		})
+	}
+}
+
 // TestCSNBinaryRoundTrip verifies that CSN values are formatted as 20-character
 // zero-padded hex literals for use in SQL WHERE clauses against CHAR(10) FOR BIT
 // DATA columns (IBMSNAP_COMMITSEQ). DB2 requires the X'...' literal to be
