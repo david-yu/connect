@@ -9,12 +9,13 @@
 package replication
 
 import (
-	"container/heap"
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -339,7 +340,7 @@ func (s *Streamer) pollChanges(ctx context.Context, afterCSN CSN, intentSeqByTab
 	}
 
 	results := make([]tableResult, 0, len(s.changeTables))
-	allEvents := make([]ChangeEvent, 0, len(s.changeTables)*s.config.PollBatchSize)
+	allEvents := make([]ChangeEvent, 0, 64) // grows dynamically; avoids worst-case over-alloc
 
 	for tableName, changeTableName := range s.changeTables {
 		tableIntentSeq := intentSeqByTable[tableName]
@@ -681,49 +682,15 @@ func pairOpcodeEvents(events []ChangeEvent) []ChangeEvent {
 	return out
 }
 
-// sortEventsByCSN sorts events using a min-heap ordered by (CSN, IntentSeq).
+// sortEventsByCSN sorts events in-place by (CSN, IntentSeq) and returns the slice.
 func (*Streamer) sortEventsByCSN(events []ChangeEvent) []ChangeEvent {
-	if len(events) == 0 {
-		return events
-	}
-
-	h := &eventHeap{}
-	heap.Init(h)
-	for _, event := range events {
-		heap.Push(h, event)
-	}
-
-	sorted := make([]ChangeEvent, 0, len(events))
-	for h.Len() > 0 {
-		sorted = append(sorted, heap.Pop(h).(ChangeEvent))
-	}
-
-	return sorted
-}
-
-// eventHeap is a min-heap of ChangeEvents ordered by (CSN, IntentSeq).
-type eventHeap []ChangeEvent
-
-func (h eventHeap) Len() int { return len(h) }
-
-func (h eventHeap) Less(i, j int) bool {
-	cmp := h[i].CSN.Compare(h[j].CSN)
-	if cmp != 0 {
-		return cmp < 0
-	}
-	return h[i].IntentSeq < h[j].IntentSeq
-}
-
-func (h eventHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
-
-func (h *eventHeap) Push(x any) { *h = append(*h, x.(ChangeEvent)) }
-
-func (h *eventHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
+	slices.SortStableFunc(events, func(a, b ChangeEvent) int {
+		if c := a.CSN.Compare(b.CSN); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.IntentSeq, b.IntentSeq)
+	})
+	return events
 }
 
 // getString extracts a string value from a scanned any pointer.
