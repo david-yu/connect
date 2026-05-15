@@ -145,10 +145,17 @@ func ParseCSN(s string) (CSN, error) {
 	return NewCSN(value), nil
 }
 
-// String returns the string representation of the CSN
+// String returns the string representation of the CSN.
+//
+// When rawBytes is present (CSN was read directly from DB2), all bytes are
+// encoded so that ParseCSN(c.String()).Equal(c) holds for 16-byte DB2 12.1 CSNs.
+// The %016X form truncates to 8 bytes and would lose bytes 8-15 of a 16-byte LSN.
 func (c CSN) String() string {
 	if c.isNull {
 		return ""
+	}
+	if len(c.rawBytes) > 0 {
+		return "CSN:" + strings.ToUpper(hex.EncodeToString(c.rawBytes))
 	}
 	return fmt.Sprintf("CSN:%016X", c.value)
 }
@@ -163,15 +170,18 @@ func (c CSN) IsNull() bool {
 	return c.isNull
 }
 
-// Compare compares two CSNs
+// Compare compares two CSNs.
 // Returns: -1 if c < other, 0 if c == other, 1 if c > other
 //
 // When both CSNs have rawBytes (i.e. were read directly from DB2), a full
 // byte-by-byte comparison is used. This is required for DB2 12.1 which uses
 // 16-byte LSNs: nearby transactions on the same log page share the same
-// first-8-byte value but differ only in the trailing bytes. Comparing only
-// the uint64 (bytes 0–7) would treat such CSNs as equal and prevent the
-// streamer from advancing past the initial SYNCHPOINT.
+// first-8-byte uint64 value but differ only in the trailing bytes. Comparing only
+// the uint64 (bytes 0–7) would treat such CSNs as equal, preventing the streamer
+// from advancing past the initial SYNCHPOINT.
+//
+// Shorter rawBytes are left-aligned (trailing positions treated as zero), matching
+// DB2 ≤11.x's CHAR(10) layout where bytes 8–9 are always zero.
 func (c CSN) Compare(other CSN) int {
 	if c.isNull && other.isNull {
 		return 0
@@ -184,9 +194,12 @@ func (c CSN) Compare(other CSN) int {
 	}
 
 	// Full raw-bytes comparison when both CSNs were read from DB2.
+	// DB2 ≤11.x stores the uint64 in bytes 0-7 with trailing zero bytes (8-9).
+	// Left-align shorter rawBytes: the missing trailing bytes are treated as zero,
+	// which is correct because DB2 trailing bytes are always zero for 10-byte CSNs.
 	if len(c.rawBytes) > 0 && len(other.rawBytes) > 0 {
 		n := max(len(c.rawBytes), len(other.rawBytes))
-		for i := range n {
+		for i := 0; i < n; i++ {
 			var cb, ob byte
 			if i < len(c.rawBytes) {
 				cb = c.rawBytes[i]
@@ -242,20 +255,28 @@ func (c CSN) Next() CSN {
 // lsnByteLen is the byte length of the target CHAR(n) FOR BIT DATA column
 // (10 for DB2 ≤ 11.x, 16 for DB2 12.1+).
 //
-// When rawBytes is available (CSN was read directly from DB2), the first
-// lsnByteLen bytes are used verbatim. When only the uint64 value is available
-// (e.g. restored from a checkpoint string), the value is written big-endian
-// into the first 8 bytes and the remainder is zero-padded.
+// DB2 ≤11.x stores the CSN as a uint64 in bytes 0–7 (big-endian) followed by
+// 2 trailing zero bytes (bytes 8–9) in the CHAR(10) column. rawBytes is
+// left-aligned in buf: copy to buf[0:], trailing bytes remain zero.
+//
+// When only the uint64 value is available (e.g. restored from checkpoint),
+// the value is written big-endian into bytes 0–7 of buf; trailing bytes are zero.
 func (c CSN) SQLHex(lsnByteLen int) string {
 	if lsnByteLen <= 0 {
 		lsnByteLen = 10
 	}
 	buf := make([]byte, lsnByteLen)
 	if len(c.rawBytes) > 0 {
-		copy(buf, c.rawBytes) // zero-pads if rawBytes shorter than lsnByteLen
+		// Left-align: rawBytes at buf[0:], trailing positions stay zero.
+		n := len(c.rawBytes)
+		if n > lsnByteLen {
+			n = lsnByteLen
+		}
+		copy(buf, c.rawBytes[:n])
 	} else {
-		v := c.value
+		// uint64 big-endian in bytes 0-7; bytes 8+ are zero padding.
 		limit := min(lsnByteLen, 8)
+		v := c.value
 		for i := limit - 1; i >= 0; i-- {
 			buf[i] = byte(v)
 			v >>= 8
@@ -350,8 +371,10 @@ type Version struct {
 	Raw   string
 }
 
-// ParseVersion parses a DB2 version string
+// ParseVersion parses a DB2 version string.
 // Examples: "SQL11050", "DB2 v11.5.0.0", "11.5"
+// All known DB2 versions have Major >= 9; a zero Major indicates a parse anomaly
+// and produces an "unknown version" error from SupportsCDC callers.
 func ParseVersion(versionStr string) (Version, error) {
 	v := Version{Raw: versionStr}
 

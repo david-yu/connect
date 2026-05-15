@@ -412,3 +412,73 @@ func TestCSNFromBytesPreservesAllBytes(t *testing.T) {
 	assert.True(t, csn10.Equal(csn8),
 		"CSN.Equal must hold between 8-byte and 10-byte encodings of the same value")
 }
+
+// TestCSNStringRoundTripPreservesRawBytes verifies that String() serialises all
+// rawBytes so that ParseCSN(c.String()).Equal(c) holds for 16-byte DB2 12.1 CSNs.
+// The previous %016X format silently dropped bytes 8–15 of a 16-byte LSN.
+func TestCSNStringRoundTripPreservesRawBytes(t *testing.T) {
+	t.Parallel()
+
+	// 16-byte CSN: bytes 8-15 are significant (DB2 12.1 format).
+	raw16 := []byte{0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0xAB, 0xCD, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05}
+	csn := NewCSNFromBytes(raw16)
+
+	s := csn.String()
+	assert.Equal(t, "CSN:0000000100000002ABCDEF0102030405", s, "String must encode all 16 bytes")
+
+	restored, err := ParseCSN(s)
+	require.NoError(t, err)
+	assert.Equal(t, 0, csn.Compare(restored), "round-trip must produce Equal CSN")
+}
+
+// TestCSNSQLHexLeftAligned verifies that SQLHex left-aligns rawBytes (DB2 ≤11.x
+// CHAR(10) layout: uint64 in bytes 0–7, trailing zeros in bytes 8–9).
+// An 8-byte rawBytes slice in a 10-byte column must pad with 2 trailing zeros,
+// not 2 leading zeros.
+func TestCSNSQLHexLeftAligned(t *testing.T) {
+	t.Parallel()
+
+	// 8-byte rawBytes [00 00 00 00 00 00 C3 50] in a 10-byte column.
+	// Left-aligned: buf = [00,00,00,00,00,00,C3,50,00,00] → "000000000000C3500000" (20 hex chars)
+	raw8 := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC3, 0x50}
+	csn := NewCSNFromBytes(raw8)
+	hex10 := csn.SQLHex(10)
+	assert.Equal(t, "000000000000C3500000", hex10)
+	assert.Len(t, hex10, 20, "10-byte column produces 20 hex characters")
+
+	// uint64-only CSN must produce the same hex as 8-byte rawBytes with same value.
+	csnUint := NewCSN(50000)
+	assert.Equal(t, hex10, csnUint.SQLHex(10), "rawBytes and uint64 paths must produce identical SQL literals")
+}
+
+// TestCSNCompareWithTrailingZeros verifies that Compare left-aligns shorter
+// rawBytes (trailing zeros), so that 8-byte and 10-byte CSNs with the same
+// uint64 value compare as equal.
+func TestCSNCompareWithTrailingZeros(t *testing.T) {
+	t.Parallel()
+
+	// DB2 ≤11.x: 10-byte = [uint64_bytes 0-7, 0x00, 0x00]; 8-byte = [uint64_bytes 0-7].
+	raw8 := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC3, 0x50}
+	raw10 := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC3, 0x50, 0x00, 0x00}
+	csn8 := NewCSNFromBytes(raw8)
+	csn10 := NewCSNFromBytes(raw10)
+	assert.Equal(t, 0, csn8.Compare(csn10), "8-byte and 10-byte encodings of the same value must compare equal")
+	assert.True(t, csn8.Equal(csn10))
+
+	// Ordering: a smaller uint64 must compare less regardless of trailing zeros.
+	rawSmall := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC3, 0x4F, 0x00, 0x00}
+	csnSmall := NewCSNFromBytes(rawSmall)
+	assert.Equal(t, -1, csnSmall.Compare(csn10), "smaller value must compare less")
+	assert.Equal(t, 1, csn10.Compare(csnSmall), "larger value must compare greater")
+}
+
+// TestCSNSQLHexFullRawBytes verifies that a 10-byte rawBytes CSN (DB2 ≤11.x
+// typical output) produces the correct 20-hex-char SQL literal without truncation.
+func TestCSNSQLHexFullRawBytes(t *testing.T) {
+	t.Parallel()
+
+	// Value 1000 (0x3E8) as 10 bytes: [00,00,00,00,00,00,03,E8,00,00]
+	raw10 := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00}
+	csn := NewCSNFromBytes(raw10)
+	assert.Equal(t, "00000000000003E80000", csn.SQLHex(10))
+}
