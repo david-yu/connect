@@ -57,7 +57,7 @@ func (e *DB2Error) IsTimeout() bool {
 func GetDiagnostics(handleType SQLSMALLINT, handle SQLHANDLE) []DB2Error {
 	var errors []DB2Error
 
-	for recNum := SQLSMALLINT(1); ; recNum++ {
+	for recNum := SQLSMALLINT(1); recNum <= 64; recNum++ {
 		sqlState := make([]byte, 6)
 		messageText := make([]byte, 1024)
 		var nativeError SQLINTEGER
@@ -82,9 +82,14 @@ func GetDiagnostics(handleType SQLSMALLINT, handle SQLHANDLE) []DB2Error {
 			break
 		}
 
-		// Null-terminate and convert to string
 		sqlStateStr := string(sqlState[:5]) // SQLSTATE is always 5 characters
-		messageStr := string(messageText[:textLen])
+		// Clamp textLen to buffer size: per ODBC spec textLen is the required length
+		// before truncation and may exceed the buffer capacity.
+		n := int(textLen)
+		if n > len(messageText) {
+			n = len(messageText)
+		}
+		messageStr := string(messageText[:n])
 
 		errors = append(errors, DB2Error{
 			SQLState:    sqlStateStr,

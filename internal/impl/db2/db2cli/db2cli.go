@@ -55,7 +55,10 @@ func LoadLibraryFromPath(path string) error {
 
 func loadLibrary(libPath string) error {
 	loadOnce.Do(func() {
-		libHandle, loadErr = purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+		// RTLD_LOCAL (not RTLD_GLOBAL) prevents DB2 CLI symbols from leaking into
+		// the global symbol namespace, which would allow a malicious libdb2.so on
+		// LD_LIBRARY_PATH to hijack symbols used by other libraries.
+		libHandle, loadErr = purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_LOCAL)
 		if loadErr != nil {
 			loadErr = fmt.Errorf("loading DB2 CLI library %s: %w (ensure DB2 client is installed and library is in PATH/LD_LIBRARY_PATH)", libPath, loadErr)
 			return

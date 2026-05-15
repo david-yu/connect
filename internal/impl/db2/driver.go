@@ -171,19 +171,33 @@ type db2Tx struct {
 
 func (tx *db2Tx) Commit() error {
 	ret := db2cli.SQLEndTran(db2cli.SQL_HANDLE_DBC, db2cli.SQLHANDLE(tx.conn.hdbc), db2cli.SQL_COMMIT)
-	if ret != db2cli.SQL_SUCCESS {
-		return errors.New("committing transaction")
+	// Always restore AUTOCOMMIT regardless of SQLEndTran outcome (MI-10):
+	// if SQLEndTran fails the connection is in an unknown state but must still
+	// be usable for future queries — leaving AUTOCOMMIT off would corrupt it.
+	restoreRet := db2cli.SQLSetConnectAttr(tx.conn.hdbc, db2cli.SQL_ATTR_AUTOCOMMIT, db2cli.SQL_AUTOCOMMIT_ON, 0)
+	if ret != db2cli.SQL_SUCCESS && ret != db2cli.SQL_SUCCESS_WITH_INFO {
+		return fmt.Errorf("committing transaction: %w",
+			db2cli.GetLastError(db2cli.SQL_HANDLE_DBC, db2cli.SQLHANDLE(tx.conn.hdbc)))
 	}
-	db2cli.SQLSetConnectAttr(tx.conn.hdbc, db2cli.SQL_ATTR_AUTOCOMMIT, db2cli.SQL_AUTOCOMMIT_ON, 0)
+	if restoreRet != db2cli.SQL_SUCCESS && restoreRet != db2cli.SQL_SUCCESS_WITH_INFO {
+		return fmt.Errorf("re-enabling autocommit after commit: %w",
+			db2cli.GetLastError(db2cli.SQL_HANDLE_DBC, db2cli.SQLHANDLE(tx.conn.hdbc)))
+	}
 	return nil
 }
 
 func (tx *db2Tx) Rollback() error {
 	ret := db2cli.SQLEndTran(db2cli.SQL_HANDLE_DBC, db2cli.SQLHANDLE(tx.conn.hdbc), db2cli.SQL_ROLLBACK)
-	if ret != db2cli.SQL_SUCCESS {
-		return errors.New("rolling back transaction")
+	// Always restore AUTOCOMMIT regardless of SQLEndTran outcome (MI-10).
+	restoreRet := db2cli.SQLSetConnectAttr(tx.conn.hdbc, db2cli.SQL_ATTR_AUTOCOMMIT, db2cli.SQL_AUTOCOMMIT_ON, 0)
+	if ret != db2cli.SQL_SUCCESS && ret != db2cli.SQL_SUCCESS_WITH_INFO {
+		return fmt.Errorf("rolling back transaction: %w",
+			db2cli.GetLastError(db2cli.SQL_HANDLE_DBC, db2cli.SQLHANDLE(tx.conn.hdbc)))
 	}
-	db2cli.SQLSetConnectAttr(tx.conn.hdbc, db2cli.SQL_ATTR_AUTOCOMMIT, db2cli.SQL_AUTOCOMMIT_ON, 0)
+	if restoreRet != db2cli.SQL_SUCCESS && restoreRet != db2cli.SQL_SUCCESS_WITH_INFO {
+		return fmt.Errorf("re-enabling autocommit after rollback: %w",
+			db2cli.GetLastError(db2cli.SQL_HANDLE_DBC, db2cli.SQLHANDLE(tx.conn.hdbc)))
+	}
 	return nil
 }
 
@@ -318,17 +332,19 @@ func (r *db2Result) RowsAffected() (int64, error) {
 type db2Rows struct {
 	stmt     *db2Stmt
 	colCount int
+	cols     []string        // cached column names, populated on first Columns() call
+	colBuf   [32 * 1024]byte // reused across column reads; one allocation per rows-object
 }
 
 func (r *db2Rows) Columns() []string {
+	if r.cols != nil {
+		return r.cols
+	}
 	cols := make([]string, r.colCount)
 	for i := 0; i < r.colCount; i++ {
 		colName := make([]byte, 256)
-		var nameLen db2cli.SQLSMALLINT
-		var dataType db2cli.SQLSMALLINT
+		var nameLen, dataType, decimalDigits, nullable db2cli.SQLSMALLINT
 		var colSize db2cli.SQLULEN
-		var decimalDigits db2cli.SQLSMALLINT
-		var nullable db2cli.SQLSMALLINT
 
 		ret := db2cli.SQLDescribeCol(
 			r.stmt.hstmt,
@@ -341,22 +357,36 @@ func (r *db2Rows) Columns() []string {
 			&decimalDigits,
 			&nullable,
 		)
-
 		if ret == db2cli.SQL_SUCCESS || ret == db2cli.SQL_SUCCESS_WITH_INFO {
-			cols[i] = string(colName[:nameLen])
+			// Clamp nameLen to buffer size: per ODBC spec nameLen is the required
+			// length before truncation and may exceed the buffer for very long names.
+			n := int(nameLen)
+			if n > len(colName) {
+				n = len(colName)
+			}
+			cols[i] = string(colName[:n])
 		} else {
 			cols[i] = fmt.Sprintf("col%d", i+1)
 		}
 	}
-	return cols
+	r.cols = cols
+	return r.cols
 }
 
 func (r *db2Rows) Close() error {
 	ret := db2cli.SQLCloseCursor(r.stmt.hstmt)
-	if ret != db2cli.SQL_SUCCESS && ret != db2cli.SQL_SUCCESS_WITH_INFO {
-		return errors.New("closing cursor")
+	if ret == db2cli.SQL_SUCCESS || ret == db2cli.SQL_SUCCESS_WITH_INFO {
+		return nil
 	}
-	return nil
+	// SQLSTATE 24000 = "invalid cursor state": cursor was never opened or is
+	// already closed. This is normal after a zero-row result set; treat as no-op.
+	diags := db2cli.GetDiagnostics(db2cli.SQL_HANDLE_STMT, db2cli.SQLHANDLE(r.stmt.hstmt))
+	for _, d := range diags {
+		if d.SQLState == db2cli.SQLSTATE_INVALID_CURSOR_STATE {
+			return nil
+		}
+	}
+	return errors.New("closing cursor")
 }
 
 func (r *db2Rows) Next(dest []driver.Value) error {
@@ -371,7 +401,10 @@ func (r *db2Rows) Next(dest []driver.Value) error {
 
 	for i := 0; i < r.colCount; i++ {
 		val, isNull, err := r.readColumnValue(db2cli.SQLUSMALLINT(i + 1))
-		if err != nil || isNull {
+		if err != nil {
+			return fmt.Errorf("reading column %d: %w", i+1, err)
+		}
+		if isNull {
 			dest[i] = nil
 		} else {
 			dest[i] = val
@@ -387,8 +420,7 @@ func (r *db2Rows) Next(dest []driver.Value) error {
 // both the silent truncation and the buf[:indicator] out-of-bounds panic that a
 // single fixed-size call produces for large VARCHAR/CLOB/BLOB columns.
 func (r *db2Rows) readColumnValue(colIdx db2cli.SQLUSMALLINT) (string, bool, error) {
-	const bufSize = 32 * 1024 // 32 KB covers most VARCHAR values in a single call
-	buf := make([]byte, bufSize)
+	buf := r.colBuf[:] // reuse the per-rows buffer; avoids 32 KB heap alloc per column per row
 	var sb strings.Builder
 
 	for {
@@ -396,10 +428,13 @@ func (r *db2Rows) readColumnValue(colIdx db2cli.SQLUSMALLINT) (string, bool, err
 		ret := db2cli.SQLGetData(
 			r.stmt.hstmt, colIdx,
 			db2cli.SQL_C_CHAR,
-			db2cli.SQLPOINTER(&buf[0]),
+			db2cli.SQLPOINTER(unsafe.Pointer(&buf[0])),
 			db2cli.SQLLEN(len(buf)),
 			&indicator,
 		)
+		// Keep buf alive across each FFI call: the GC must not relocate the backing
+		// array while DB2 CLI holds the unsafe.Pointer reference.
+		runtime.KeepAlive(buf)
 
 		switch {
 		case ret == db2cli.SQL_NO_DATA:
@@ -412,8 +447,8 @@ func (r *db2Rows) readColumnValue(colIdx db2cli.SQLUSMALLINT) (string, bool, err
 		}
 
 		// Determine how many bytes DB2 wrote into buf.
-		// If indicator >= bufSize the value was truncated; DB2 wrote exactly bufSize bytes
-		// (possibly including a null-terminator at buf[bufSize-1]).
+		// If indicator >= len(buf) the value was truncated; DB2 wrote exactly len(buf) bytes
+		// (possibly including a null-terminator at buf[len(buf)-1]).
 		// If indicator < 0 (SQL_NO_TOTAL) consume until the null-terminator.
 		var written int
 		if indicator >= 0 && int(indicator) < len(buf) {

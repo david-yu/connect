@@ -9,7 +9,6 @@
 package db2cli
 
 import (
-	"fmt"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -185,7 +184,7 @@ func registerDiagnosticFunctions() error {
 // SQLAllocHandle allocates an environment, connection, or statement handle
 func SQLAllocHandle(handleType SQLSMALLINT, inputHandle SQLHANDLE, outputHandle *SQLHANDLE) SQLRETURN {
 	if err := LoadLibrary(); err != nil {
-		panic(fmt.Sprintf("DB2 CLI not loaded: %v", err))
+		return SQL_ERROR
 	}
 	return sqlAllocHandle(handleType, inputHandle, outputHandle)
 }
@@ -223,19 +222,25 @@ func SQLDriverConnect(hdbc SQLHDBC, connStr string) (string, SQLRETURN) {
 	}
 
 	connStrBytes := append([]byte(connStr), 0)
-	outConnStr := make([]byte, 1024)
+	outConnStr := make([]byte, 4096) // 4 KB — connection strings can exceed 1 KB
 	var outConnStrLen SQLSMALLINT
 
 	ret := sqlDriverConnect(
 		hdbc,
 		0, // No window handle
 		(*SQLCHAR)(unsafe.Pointer(&connStrBytes[0])), SQLSMALLINT(len(connStr)),
-		(*SQLCHAR)(unsafe.Pointer(&outConnStr[0])), 1024,
+		(*SQLCHAR)(unsafe.Pointer(&outConnStr[0])), 4096,
 		&outConnStrLen,
 		0, // SQL_DRIVER_NOPROMPT
 	)
 
-	return string(outConnStr[:outConnStrLen]), ret
+	// Clamp to buffer size: per ODBC spec outConnStrLen is the required length
+	// before truncation and may exceed the buffer capacity.
+	n := int(outConnStrLen)
+	if n > len(outConnStr) {
+		n = len(outConnStr)
+	}
+	return string(outConnStr[:n]), ret
 }
 
 // SQLDisconnect closes a connection
